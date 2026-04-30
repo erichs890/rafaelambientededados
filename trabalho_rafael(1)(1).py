@@ -134,232 +134,12 @@ class SQLApp(tk.Tk):
                          font=("Segoe UI", 18, "bold"))
         style.configure("Subtitle.TLabel", background=BG_DARK, foreground=FG_DIM,
                          font=("Segoe UI", 9))
-        style.configure("Section.TLabel", background=BG_PANEL,    # ── Heuristica: Reducao de Atributos (projection pushdown) ──────────
-    def _columns_for_table(self, columns, table_name):
-        result = []
-        prefix = table_name.lower() + "."
-        for col in columns:
-            if col == "*":
-                result.append(col)
-            elif col.lower().startswith(prefix):
-                result.append(col)
-        return result
-
-    def _build_attribute_reduction_graph(self, parsed):
-        G = nx.DiGraph()
-
-        tables = [parsed["table"]]
-        if "join_table" in parsed:
-            tables.append(parsed["join_table"])
-
-        predicates = []
-        if "join_on" in parsed:
-            predicates.extend(self._flatten_conjunction(parsed["join_on"]))
-        if "where" in parsed:
-            predicates.extend(self._flatten_conjunction(parsed["where"]))
-
-        single_table_preds = {t: [] for t in tables}
-        multi_table_preds = []
-        for p in predicates:
-            refs = self._predicate_tables(p, tables)
-            if len(refs) == 1:
-                single_table_preds[next(iter(refs))].append(p)
-            else:
-                multi_table_preds.append(p)
-
-        table_outputs = {}
-        for i, t in enumerate(tables):
-            tnode = f"T{i}"
-            G.add_node(tnode, label=t, type="table", order=0)
-            current = tnode
-
-            if single_table_preds[t]:
-                sel_id = f"SEL_{i}"
-                cond_txt = " AND ".join(f"{p[0]} {p[1]} {p[2]}" for p in single_table_preds[t])
-                G.add_node(sel_id, label=f"o  {cond_txt}", type="selection", order=1)
-                G.add_edge(sel_id, current)
-                current = sel_id
-
-            # FIX: only real column refs (must contain '.') — no literals like "Joao"/"100"
-            cols_for_t = self._columns_for_table(parsed["columns"], t)
-            pred_cols = []
-            for p in single_table_preds[t] + multi_table_preds:
-                for side in (p[0], p[2]):
-                    if (isinstance(side, str) and "." in side
-                            and side.lower().startswith(t.lower() + ".")
-                            and side not in cols_for_t
-                            and side not in pred_cols):
-                        pred_cols.append(side)
-            all_cols = list(dict.fromkeys(cols_for_t + pred_cols)) or ["*"]
-
-            proj_id = f"PROJ_{i}"
-            G.add_node(proj_id, label=f"pi  {', '.join(all_cols)}", type="projection", order=2)
-            G.add_edge(proj_id, current)
-            table_outputs[t] = proj_id
-
-        if len(tables) > 1:
-            if multi_table_preds:
-                cond_txt = " AND ".join(f"{p[0]} {p[1]} {p[2]}" for p in multi_table_preds)
-                G.add_node("JOIN", label=f"|x|  {cond_txt}", type="join", order=3)
-                for t in tables:
-                    G.add_edge("JOIN", table_outputs[t])
-                root = "JOIN"
-            else:
-                G.add_node("CART", label="X  Produto Cartesiano", type="cartesian", order=3)
-                for t in tables:
-                    G.add_edge("CART", table_outputs[t])
-                root = "CART"
-        else:
-            root = table_outputs[tables[0]]
-
-        return G, root
-
-    # ── Layout recursivo por subarvore (evita sobreposicao) ───────────────
-    def _subtree_layout(self, G, root, canvas_w, canvas_h):
-        CHAR_W   = 7
-        NODE_PAD = 44
-        H_GAP    = 50
-        V_STEP   = 105
-        TOP      = 55
-
-        def node_w(n):
-            return len(G.nodes[n].get("label", n)) * CHAR_W + NODE_PAD
-
-        memo = {}
-        def sub_w(n):
-            if n in memo:
-                return memo[n]
-            ch = list(G.successors(n))
-            v = node_w(n) if not ch else max(
-                node_w(n),
-                sum(sub_w(c) for c in ch) + H_GAP * (len(ch) - 1)
-            )
-            memo[n] = v
-            return v
-
-        depths = {root: 0}
-        q = [root]
-        while q:
-            n = q.pop(0)
-            for c in G.successors(n):
-                if c not in depths:
-                    depths[c] = depths[n] + 1
-                    q.append(c)
-
-        effective_w = max(canvas_w - 60, sub_w(root) + 80)
-
-        pos = {}
-        def assign(n, left, right):
-            pos[n] = ((left + right) / 2, TOP + depths[n] * V_STEP)
-            ch = list(G.successors(n))
-            if not ch:
-                return
-            cws = [sub_w(c) for c in ch]
-            span = sum(cws) + H_GAP * (len(ch) - 1)
-            cx = (left + right) / 2 - span / 2
-            for c, cw in zip(ch, cws):
-                assign(c, cx, cx + cw)
-                cx += cw + H_GAP
-
-        assign(root, 20, effective_w - 20)
-        return pos, depths, effective_w
-
-    # ── Janela premium de Reducao de Atributos ────────────────────────────
-    def _show_attribute_reduction_graph(self):
-        parsed = self._parse_for_graph()
-        if parsed is None:
-            return
-        G, root = self._build_attribute_reduction_graph(parsed)
-
-        NODE_H = 36
-        CHAR_W = 7
-        STYLES = {
-            "table":      {"bg": "#1f1233", "border": FG_NUMBER,   "fg": FG_NUMBER},
-            "selection":  {"bg": "#0f1e30", "border": FG_OPERATOR,  "fg": FG_OPERATOR},
-            "projection": {"bg": "#0d2618", "border": FG_STRING,    "fg": FG_STRING},
-            "join":       {"bg": "#1e1a08", "border": FG_TABLE_HD,  "fg": FG_TABLE_HD},
-            "cartesian":  {"bg": "#2a0f0f", "border": FG_KEYWORD,   "fg": FG_KEYWORD},
-        }
-
-        win = tk.Toplevel(self)
-        win.title("Heuristica - Reducao de Atributos")
-        win.geometry("1180x820")
-        win.configure(bg=BG_DARK)
-        win.transient(self)
-
-        tk.Label(win, text="HEURISTICA  —  REDUCAO DE ATRIBUTOS",
-                 bg=BG_DARK, fg=FG_ACCENT,
-                 font=("Segoe UI", 17, "bold")).pack(pady=(16, 0))
-        tk.Label(win, text=f"Nos: {G.number_of_nodes()}  |  Arestas: {G.number_of_edges()}",
-                 bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 9)).pack(anchor="w", padx=22)
-
-        cf = tk.Frame(win, bg=BORDER_COLOR)
-        cf.pack(fill="both", expand=True, padx=20, pady=(10, 6))
-        hbar = tk.Scrollbar(cf, orient="horizontal")
-        hbar.pack(side="bottom", fill="x")
-        canvas = tk.Canvas(cf, bg=BG_EDITOR, highlightthickness=0,
-                           xscrollcommand=hbar.set)
-        canvas.pack(fill="both", expand=True, padx=1, pady=1)
-        hbar.config(command=canvas.xview)
-
-        def redraw(*_):
-            canvas.delete("all")
-            cw = canvas.winfo_width()
-            if cw < 50:
-                return
-            pos, depths, eff_w = self._subtree_layout(G, root, cw, 0)
-            max_y = max(y for _, y in pos.values()) + NODE_H + 40
-            canvas.config(scrollregion=(0, 0, eff_w, max_y))
-
-            for u, v in G.edges():
-                x1, y1 = pos[u]
-                x2, y2 = pos[v]
-                mid = (y1 + y2) / 2
-                canvas.create_line(x1, y1 + NODE_H // 2 + 1,
-                                   x1, mid, x2, mid,
-                                   x2, y2 - NODE_H // 2 - 1,
-                                   fill="#50507a", width=2, joinstyle="round")
-                canvas.create_line(x2, mid, x2, y2 - NODE_H // 2 - 1,
-                                   fill="#7878b0", width=2,
-                                   arrow="last", arrowshape=(10, 13, 4))
-
-            for n in G.nodes():
-                x, y = pos[n]
-                ntype = G.nodes[n].get("type", "table")
-                label = G.nodes[n].get("label", n)
-                st = STYLES.get(ntype, STYLES["table"])
-                bw = max(len(label) * CHAR_W + 44, 90)
-                x1, y1 = x - bw / 2, y - NODE_H / 2
-                x2, y2 = x + bw / 2, y + NODE_H / 2
-                canvas.create_rectangle(x1 + 4, y1 + 4, x2 + 4, y2 + 4,
-                                        fill="#0a0a18", outline="")
-                canvas.create_rectangle(x1, y1, x2, y2,
-                                        fill=st["bg"], outline=st["border"], width=2)
-                canvas.create_rectangle(x1 + 2, y1 + 2, x2 - 2, y1 + 6,
-                                        fill=st["border"], outline="")
-                canvas.create_text(x, y + 2, text=label,
-                                   fill=st["fg"],
-                                   font=("Cascadia Code", 10, "bold"))
-
-        canvas.bind("<Configure>", redraw)
-
-        of = tk.Frame(win, bg=BG_PANEL)
-        of.pack(fill="x", padx=20, pady=(0, 16))
-        tk.Label(of, text="Ordem de Execucao (bottom-up)",
-                 bg=BG_PANEL, fg=FG_TABLE_HD,
-                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
-        grid = tk.Frame(of, bg=BG_PANEL)
-        grid.pack(fill="x", padx=10, pady=(0, 8))
-        ordered = sorted(G.nodes(data=True), key=lambda x: x[1].get("order", 0))
-        for idx, (nid, data) in enumerate(ordered):
-            st = STYLES.get(data.get("type", "table"), {"fg": FG_TEXT})
-            tk.Label(grid, text=f"{idx+1}.  {data.get('label', nid)}",
-                     bg=BG_PANEL, fg=st["fg"],
-                     font=("Cascadia Code", 10), anchor="w"
-                     ).grid(row=idx // 2, column=idx % 2,
-                            sticky="w", padx=16, pady=2)
-        tk.Label(of, text="", bg=BG_PANEL).pack(pady=2)
-
+        style.configure("Section.TLabel", background=BG_PANEL, foreground=FG_TABLE_HD,
+                         font=("Segoe UI", 11, "bold"))
+        style.configure("Status.TLabel", background=BG_DARK, foreground=FG_DIM,
+                         font=("Segoe UI", 9))
+        style.configure("Success.TLabel", background=BG_DARK, foreground=BG_SUCCESS,
+                         font=("Segoe UI", 9, "bold"))
         style.configure("Error.TLabel", background=BG_DARK, foreground=BG_ERROR,
                          font=("Segoe UI", 9, "bold"))
 
@@ -1035,7 +815,6 @@ class SQLApp(tk.Tk):
 
     # ── Heuristica: Reducao de Atributos (projection pushdown) ──────────
     def _columns_for_table(self, columns, table_name):
-        """Retorna as colunas do SELECT que pertencem a uma tabela especifica."""
         result = []
         prefix = table_name.lower() + "."
         for col in columns:
@@ -1046,24 +825,11 @@ class SQLApp(tk.Tk):
         return result
 
     def _build_attribute_reduction_graph(self, parsed):
-        """
-        Heuristica de Reducao de Atributos:
-        - O pi (projecao) desce logo acima de cada sigma (selecao),
-          projetando apenas os atributos necessarios para aquela tabela.
-        - O JOIN fica no TOPO, acima dos ramos ja projetados.
-        Estrutura resultante (com JOIN):
-            JOIN
-            ├── pi <cols_t0>          pi <cols_t1>
-            │     └── sigma (t0)            └── sigma (t1)
-            │           └── T0                    └── T1
-        """
         G = nx.DiGraph()
-
         tables = [parsed["table"]]
         if "join_table" in parsed:
             tables.append(parsed["join_table"])
 
-        # Separar predicados por tabela (igual a reducao de tuplas)
         predicates = []
         if "join_on" in parsed:
             predicates.extend(self._flatten_conjunction(parsed["join_on"]))
@@ -1079,17 +845,12 @@ class SQLApp(tk.Tk):
             else:
                 multi_table_preds.append(p)
 
-        # Para cada tabela: T -> sigma -> pi  (pi logo acima do sigma)
-        order_counter = [0]
-        table_outputs = {}  # topo de cada ramo apos projecao
-
+        table_outputs = {}
         for i, t in enumerate(tables):
-            # No da tabela
             tnode = f"T{i}"
             G.add_node(tnode, label=t, type="table", order=0)
             current = tnode
 
-            # Sigma (se houver predicado para esta tabela)
             if single_table_preds[t]:
                 sel_id = f"SEL_{i}"
                 cond_txt = " AND ".join(f"{p[0]} {p[1]} {p[2]}" for p in single_table_preds[t])
@@ -1097,54 +858,174 @@ class SQLApp(tk.Tk):
                 G.add_edge(sel_id, current)
                 current = sel_id
 
-            # Pi logo acima do sigma (projecao empurrada para baixo)
+            # FIX: so inclui referencias reais de colunas (com '.')
             cols_for_t = self._columns_for_table(parsed["columns"], t)
-            # Incluir tambem colunas usadas no join/where desta tabela
             pred_cols = []
-            for p in single_table_preds[t]:
+            for p in single_table_preds[t] + multi_table_preds:
                 for side in (p[0], p[2]):
-                    if isinstance(side, str) and side not in pred_cols:
+                    if (isinstance(side, str) and "." in side
+                            and side.lower().startswith(t.lower() + ".")
+                            and side not in cols_for_t and side not in pred_cols):
                         pred_cols.append(side)
-            for p in multi_table_preds:
-                for side in (p[0], p[2]):
-                    if isinstance(side, str) and side.lower().startswith(t.lower() + ".") and side not in pred_cols:
-                        pred_cols.append(side)
-            all_cols_for_t = list(dict.fromkeys(cols_for_t + pred_cols))  # sem duplicatas
-            if not all_cols_for_t:
-                all_cols_for_t = ["*"]
+            all_cols = list(dict.fromkeys(cols_for_t + pred_cols)) or ["*"]
 
             proj_id = f"PROJ_{i}"
-            cols_txt = ", ".join(all_cols_for_t)
-            G.add_node(proj_id, label=f"pi  {cols_txt}", type="projection", order=2)
+            G.add_node(proj_id, label=f"pi  {', '.join(all_cols)}", type="projection", order=2)
             G.add_edge(proj_id, current)
             table_outputs[t] = proj_id
 
-        # JOIN (ou Produto Cartesiano) no topo
         if len(tables) > 1:
             if multi_table_preds:
-                join_id = "JOIN"
                 cond_txt = " AND ".join(f"{p[0]} {p[1]} {p[2]}" for p in multi_table_preds)
-                G.add_node(join_id, label=f"|x|  {cond_txt}", type="join", order=3)
+                G.add_node("JOIN", label=f"|x|  {cond_txt}", type="join", order=3)
                 for t in tables:
-                    G.add_edge(join_id, table_outputs[t])
-                root = join_id
+                    G.add_edge("JOIN", table_outputs[t])
+                root = "JOIN"
             else:
-                cart_id = "CART"
-                G.add_node(cart_id, label="X  Produto Cartesiano", type="cartesian", order=3)
+                G.add_node("CART", label="X  Produto Cartesiano", type="cartesian", order=3)
                 for t in tables:
-                    G.add_edge(cart_id, table_outputs[t])
-                root = cart_id
+                    G.add_edge("CART", table_outputs[t])
+                root = "CART"
         else:
             root = table_outputs[tables[0]]
-
         return G, root
+
+    def _subtree_layout(self, G, root, canvas_w):
+        """Layout recursivo por subarvore — evita sobreposicao de nos."""
+        CHAR_W, PAD, H_GAP, V_STEP, TOP = 7, 44, 60, 110, 55
+
+        def node_w(n):
+            return len(G.nodes[n].get("label", n)) * CHAR_W + PAD
+
+        memo = {}
+        def sub_w(n):
+            if n not in memo:
+                ch = list(G.successors(n))
+                memo[n] = node_w(n) if not ch else max(
+                    node_w(n), sum(sub_w(c) for c in ch) + H_GAP * (len(ch) - 1))
+            return memo[n]
+
+        depths = {root: 0}
+        q = [root]
+        while q:
+            n = q.pop(0)
+            for c in G.successors(n):
+                if c not in depths:
+                    depths[c] = depths[n] + 1
+                    q.append(c)
+
+        eff_w = max(canvas_w - 40, sub_w(root) + 80)
+        pos = {}
+
+        def assign(n, left, right):
+            pos[n] = ((left + right) / 2, TOP + depths[n] * V_STEP)
+            ch = list(G.successors(n))
+            if not ch:
+                return
+            cws = [sub_w(c) for c in ch]
+            span = sum(cws) + H_GAP * (len(ch) - 1)
+            cx = (left + right) / 2 - span / 2
+            for c, cw in zip(ch, cws):
+                assign(c, cx, cx + cw)
+                cx += cw + H_GAP
+
+        assign(root, 20, eff_w - 20)
+        return pos, depths, eff_w
 
     def _show_attribute_reduction_graph(self):
         parsed = self._parse_for_graph()
         if parsed is None:
             return
         G, root = self._build_attribute_reduction_graph(parsed)
-        self._render_graph_window("Heuristica - Reducao de Atributos", G, root)
+
+        NODE_H = 36
+        CHAR_W = 7
+        STYLES = {
+            "table":      {"bg": "#1f1233", "border": FG_NUMBER,  "fg": FG_NUMBER},
+            "selection":  {"bg": "#0f1e30", "border": FG_OPERATOR, "fg": FG_OPERATOR},
+            "projection": {"bg": "#0d2618", "border": FG_STRING,  "fg": FG_STRING},
+            "join":       {"bg": "#1e1a08", "border": FG_TABLE_HD, "fg": FG_TABLE_HD},
+            "cartesian":  {"bg": "#2a0f0f", "border": FG_KEYWORD, "fg": FG_KEYWORD},
+        }
+
+        win = tk.Toplevel(self)
+        win.title("Heuristica - Reducao de Atributos")
+        win.geometry("1200x820")
+        win.configure(bg=BG_DARK)
+        win.transient(self)
+
+        tk.Label(win, text="HEURISTICA  —  REDUCAO DE ATRIBUTOS",
+                 bg=BG_DARK, fg=FG_ACCENT,
+                 font=("Segoe UI", 17, "bold")).pack(pady=(16, 0))
+        tk.Label(win, text=f"Nos: {G.number_of_nodes()}  |  Arestas: {G.number_of_edges()}",
+                 bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 9)).pack(anchor="w", padx=22)
+
+        cf = tk.Frame(win, bg=BORDER_COLOR)
+        cf.pack(fill="both", expand=True, padx=20, pady=(10, 6))
+        hbar = tk.Scrollbar(cf, orient="horizontal")
+        hbar.pack(side="bottom", fill="x")
+        canvas = tk.Canvas(cf, bg=BG_EDITOR, highlightthickness=0,
+                           xscrollcommand=hbar.set)
+        canvas.pack(fill="both", expand=True, padx=1, pady=1)
+        hbar.config(command=canvas.xview)
+
+        def redraw(*_):
+            canvas.delete("all")
+            cw = canvas.winfo_width()
+            if cw < 50:
+                return
+            pos, depths, eff_w = self._subtree_layout(G, root, cw)
+            max_y = max(y for _, y in pos.values()) + NODE_H + 40
+            canvas.config(scrollregion=(0, 0, eff_w, max_y))
+
+            for u, v in G.edges():
+                x1, y1 = pos[u]
+                x2, y2 = pos[v]
+                mid = (y1 + y2) / 2
+                canvas.create_line(x1, y1 + NODE_H // 2 + 1,
+                                   x1, mid, x2, mid,
+                                   x2, y2 - NODE_H // 2 - 1,
+                                   fill="#50507a", width=2, joinstyle="round")
+                canvas.create_line(x2, mid, x2, y2 - NODE_H // 2 - 1,
+                                   fill="#7070b0", width=2,
+                                   arrow="last", arrowshape=(10, 13, 4))
+
+            for n in G.nodes():
+                x, y = pos[n]
+                ntype = G.nodes[n].get("type", "table")
+                label = G.nodes[n].get("label", n)
+                st = STYLES.get(ntype, STYLES["table"])
+                bw = max(len(label) * CHAR_W + 44, 90)
+                x1, y1 = x - bw / 2, y - NODE_H / 2
+                x2, y2 = x + bw / 2, y + NODE_H / 2
+                canvas.create_rectangle(x1 + 4, y1 + 4, x2 + 4, y2 + 4,
+                                        fill="#0a0a18", outline="")
+                canvas.create_rectangle(x1, y1, x2, y2,
+                                        fill=st["bg"], outline=st["border"], width=2)
+                canvas.create_rectangle(x1 + 2, y1 + 2, x2 - 2, y1 + 6,
+                                        fill=st["border"], outline="")
+                canvas.create_text(x, y + 2, text=label,
+                                   fill=st["fg"],
+                                   font=("Cascadia Code", 10, "bold"))
+
+        canvas.bind("<Configure>", redraw)
+
+        of = tk.Frame(win, bg=BG_PANEL)
+        of.pack(fill="x", padx=20, pady=(0, 16))
+        tk.Label(of, text="Ordem de Execucao (bottom-up)",
+                 bg=BG_PANEL, fg=FG_TABLE_HD,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
+        grid = tk.Frame(of, bg=BG_PANEL)
+        grid.pack(fill="x", padx=10, pady=(0, 8))
+        ordered = sorted(G.nodes(data=True), key=lambda x: x[1].get("order", 0))
+        for idx, (nid, data) in enumerate(ordered):
+            st = STYLES.get(data.get("type", "table"), {"fg": FG_TEXT})
+            tk.Label(grid, text=f"{idx+1}.  {data.get('label', nid)}",
+                     bg=BG_PANEL, fg=st["fg"],
+                     font=("Cascadia Code", 10), anchor="w"
+                     ).grid(row=idx // 2, column=idx % 2,
+                            sticky="w", padx=16, pady=2)
+        tk.Label(of, text="", bg=BG_PANEL).pack(pady=2)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
