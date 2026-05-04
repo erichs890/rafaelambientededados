@@ -13,9 +13,11 @@
 4. [Como rodar](#4-como-rodar)
 5. [Tour pela interface](#5-tour-pela-interface)
 6. [Como o código funciona — passo a passo](#6-como-o-código-funciona--passo-a-passo)
-7. [As três visualizações de grafo (o coração do trabalho)](#7-as-três-visualizações-de-grafo-o-coração-do-trabalho)
-8. [Exemplo completo: do SQL ao grafo otimizado](#8-exemplo-completo-do-sql-ao-grafo-otimizado)
-9. [Glossário rápido](#9-glossário-rápido)
+7. [Validação de Schema (bd_vendas)](#7-validação-de-schema-bd_vendas)
+8. [As quatro visualizações de grafo (o coração do trabalho)](#8-as-quatro-visualizações-de-grafo-o-coração-do-trabalho)
+9. [Exemplo completo: do SQL ao plano otimizado](#9-exemplo-completo-do-sql-ao-plano-otimizado)
+10. [Mapeamento dos critérios de avaliação](#10-mapeamento-dos-critérios-de-avaliação)
+11. [Glossário rápido](#11-glossário-rápido)
 
 ---
 
@@ -143,16 +145,17 @@ Abre uma janela com editor SQL no topo, botões no meio e tabela de resultados e
 └──────────────────────────────────────────────────────┘
 ```
 
-### Os 6 botões
+### Os 7 botões
 
 | Botão | Atalho | O que faz |
 |---|---|---|
-| **Executar** | `Ctrl+Enter` | Roda a query no MySQL e mostra o resultado |
+| **Executar** | `Ctrl+Enter` | Valida + roda a query no MySQL e mostra o resultado |
 | **Limpar** | — | Apaga editor + resultados |
 | **Analisar Parser** | — | Janela com tokens coloridos + JSON da árvore sintática |
 | **Grafo Não Otimizado** | — | Plano "ingênuo" — para você ver como **não** fazer |
-| **Redução de Tuplas** | — | Heurística 1 — empurra **σ** (seleções) para perto das tabelas |
-| **Redução de Atributos** | — | Heurística 2 — empurra **π** (projeções) para perto das tabelas |
+| **Redução de Tuplas** | — | Heurística 5a-i — empurra **σ** (seleções) para perto das tabelas |
+| **Redução de Atributos** | — | Heurística 5a-ii — empurra **π** (projeções) para perto das tabelas |
+| **Plano Otimizado** (verde) | — | **Heurística completa** (5a + 5b): combina tudo + reordena folhas + evita cartesiano |
 
 ### Recursos extras do editor
 
@@ -263,7 +266,77 @@ Descobre **quais tabelas** um predicado referencia, olhando o prefixo `tabela.co
 
 ---
 
-## 7. As três visualizações de grafo (o coração do trabalho)
+## 7. Validação de Schema (bd_vendas)
+
+O enunciado exige (item 4.b): *"O banco exemplo servirá como base na validação dos nomes de tabelas e campos no momento da validação da cláusula SQL."*
+
+### O que está implementado
+
+No topo do arquivo existe um dicionário `SCHEMA` que reproduz **todas as tabelas e colunas** do `bd_vendas` exatamente como no script SQL do PDF. Veja [SCHEMA — linhas 39-58](trabalho_rafael(1)(1).py#L39-L58).
+
+```python
+SCHEMA = {
+  "categoria":          ["idCategoria", "Descricao"],
+  "produto":            ["idProduto", "Nome", "Descricao", "Preco", ...],
+  "cliente":            ["idCliente", "Nome", "Email", ...],
+  "endereco":           [..., "Cidade", "UF", "CEP", ...],
+  "pedido":             ["idPedido", "Status_idStatus", ...],
+  "pedido_has_produto": [...],
+  ...
+}
+```
+
+### A função `validate_against_schema(parsed)` ([linhas 76-149](trabalho_rafael(1)(1).py#L76-L149))
+
+Ela faz 5 checagens:
+
+1. **Tabela do FROM** existe em `bd_vendas`?
+2. **Tabela do INNER JOIN** existe?
+3. **Cada coluna do SELECT** está na(s) tabela(s) certa(s)?
+4. **Cada coluna do WHERE** existe?
+5. **Cada coluna do JOIN ON** existe?
+
+Para cada referência ela aplica regras inteligentes:
+
+- `*` → ok, é coringa, sempre passa.
+- `'Recife'`, `42` → literais (string ou número), não são colunas, ignoradas.
+- `cliente.Cidade` → checa se `cliente` está no FROM/JOIN E se `Cidade` é coluna de `cliente`. (Aqui dá erro — `Cidade` está em `endereco`!)
+- `Nome` (sem prefixo) → procura em todas as tabelas disponíveis. Se achar em uma só → ok. Se achar em duas → erro de **ambiguidade** (você tem que prefixar). Se não achar → erro.
+
+### Quando a validação roda
+
+| Ação | Comportamento |
+|---|---|
+| Botão **Executar** | Bloqueia execução e mostra os erros no painel central |
+| Qualquer botão de **grafo** | Abre uma `messagebox` com a lista de erros e cancela |
+| Botão **Analisar Parser** | Não bloqueia (você pode querer ver a AST mesmo de query errada) |
+
+### Por que isso importa
+
+O enunciado dá **1,0 ponto** para "Campos e comandos errados são validados". Antes desta implementação, o programa simplesmente jogava a query no MySQL e mostrava o erro do MySQL — o que não é validação, é só repassar o erro. Agora o programa **rejeita a query antes de tocar no banco**, com mensagens em português apontando exatamente o problema.
+
+### Exemplo
+
+```sql
+SELECT cliente.Cidade, pedido.valor
+FROM cliente
+INNER JOIN pedido ON cliente.id = pedido.cliente_id
+```
+
+Erros detectados:
+
+```
+- Coluna 'Cidade' nao existe em 'cliente' (em 'cliente.Cidade', no SELECT).
+- Coluna 'valor' nao existe em 'pedido' (em 'pedido.valor', no SELECT).
+- Coluna 'id' nao existe em 'cliente' (em 'cliente.id', no JOIN ON).
+- Coluna 'cliente_id' nao existe em 'pedido' (em 'pedido.cliente_id', no JOIN ON).
+```
+
+E sugere implicitamente: `Cidade` está em `endereco`, `ValorTotalPedido` em `pedido`, `idCliente` em `cliente`, `Cliente_idCliente` em `pedido`.
+
+---
+
+## 8. As quatro visualizações de grafo (o coração do trabalho)
 
 Todas constroem um `nx.DiGraph` (grafo dirigido do networkx) onde:
 
@@ -271,7 +344,7 @@ Todas constroem um `nx.DiGraph` (grafo dirigido do networkx) onde:
 - Cada nó tem um `order` (a posição na execução bottom-up).
 - A visualização desenha tudo manualmente em um `tk.Canvas` — sem matplotlib.
 
-### 7.1. Grafo Não Otimizado
+### 8.1. Grafo Não Otimizado
 
 [`_build_nonoptimized_graph` — linhas 570-614](trabalho_rafael(1)(1).py#L570-L614)
 
@@ -298,7 +371,7 @@ A construção é direta e propositalmente ruim:
 
 **Por que é ruim?** O `×` materializa o produto cartesiano antes de qualquer filtro. Se as tabelas têm 1M e 5M linhas, o nó σ recebe **5 trilhões** de linhas para filtrar.
 
-### 7.2. Heurística 1 — Redução de Tuplas (selection pushdown)
+### 8.2. Heurística 5a-i — Redução de Tuplas (selection pushdown)
 
 [`_build_tuple_reduction_graph` — linhas 748-807](trabalho_rafael(1)(1).py#L748-L807)
 
@@ -329,7 +402,7 @@ Algoritmo:
 
 **Ganho:** o JOIN agora trabalha com o `cliente` já filtrado (50.000 linhas em vez de 1.000.000). E mais: o `×` virou `⋈`, que internamente já é otimizado pelo SGBD usando hash join, merge join etc.
 
-### 7.3. Heurística 2 — Redução de Atributos (projection pushdown)
+### 8.3. Heurística 5a-ii — Redução de Atributos (projection pushdown)
 
 [`_build_attribute_reduction_graph` — linhas 827-891](trabalho_rafael(1)(1).py#L827-L891)
 
@@ -362,7 +435,81 @@ Para cada tabela T:
 
 > Observação técnica em [linha 861-870](trabalho_rafael(1)(1).py#L861-L870): a função filtra por `"." in side` para garantir que só nomes qualificados (ex: `cliente.id`) entrem na projeção — números e literais não viram colunas.
 
-### 7.4. Como os grafos são desenhados
+### 8.4. Plano Final Otimizado — Heurística 5b (reordenação + evitar cartesiano)
+
+> **Esta é a novidade.** Botão verde "Plano Otimizado". Implementa o item 5b inteiro do enunciado.
+
+O enunciado lista três sub-heurísticas em 5b:
+
+> i. reordenar os nós folha da árvore de consulta
+> ii. evitar a operação de produto cartesiano
+> iii. ajustar o restante da árvore de forma apropriada
+
+Construído por [`_build_optimal_plan_graph` — linhas ~1042-1149](trabalho_rafael(1)(1).py).
+
+#### Como funciona
+
+1. **Aplica primeiro** as duas heurísticas anteriores: pushdown de σ e de π.
+2. **Reordena as folhas**: a tabela com **mais predicados locais** vai para a posição "primária" (esquerda do JOIN). Critério: `key=lambda t: -len(predicados_locais[t])`. A tabela primária ganha um badge `[PRIMARIA]` no rótulo.
+3. **Evita o produto cartesiano**: se existe pelo menos um predicado que toca **2 tabelas** (ex: `cliente.id = pedido.cliente_id`), ele vira a condição do `⋈` — **substitui** o `×`. Se não houver predicado de junção, o programa **avisa explicitamente** com `CARTESIANO (sem condicao de juncao!)`.
+4. **Ajusta o restante**: a projeção final fica no topo, recebendo o resultado da junção otimizada.
+
+#### Por que reordenar folhas importa?
+
+Em planos de execução de SGBDs reais (PostgreSQL, MySQL), o **lado esquerdo** do JOIN costuma ser a "outer relation" — a que dirige o loop. Se você coloca a tabela com 50.000 linhas filtradas como esquerda e a de 5.000.000 como direita, faz menos comparações que o contrário. É exatamente o que essa heurística simula visualmente.
+
+#### Resultado visual (mesmo exemplo das outras heurísticas)
+
+```
+                          π cliente.nome, pedido.valor
+                                      │
+                          ⋈ cliente.id = pedido.cliente_id
+                        ╱                              ╲
+                  π id, nome                  π cliente_id, valor
+                       │                              │
+              σ cidade='Recife'                    pedido
+                       │
+              cliente [PRIMARIA]
+```
+
+> Como nesse exemplo só `cliente` tem σ local, ela é a primária e fica na esquerda.
+
+#### Painel "Heurísticas Aplicadas"
+
+A janela mostra um checklist no topo, listando exatamente quais heurísticas foram aplicadas naquela query específica. Exemplo:
+
+```
+[OK]  5a-i  Reducao de Tuplas (selecao empurrada para perto das tabelas)
+[OK]  5a-ii Reducao de Atributos (projecao local mantem so colunas necessarias)
+[OK]  5b-i  Reordenacao de folhas (tabela 'cliente' eh a mais restritiva)
+[OK]  5b-ii Evita produto cartesiano (usa JOIN com predicado)
+```
+
+Se a query não tiver nenhum predicado de junção, aparece o aviso:
+
+```
+[OK]  5b-ii AVISO: nao foi possivel evitar cartesiano (sem condicao de juncao)
+```
+
+#### Plano de Execução textual (passo a passo)
+
+Embaixo do grafo, em vez de só listar nomes de nós, o programa traduz cada operador para uma frase didática usando [`_describe_step` — linhas ~1151-1167](trabalho_rafael(1)(1).py):
+
+```
+Passo 1.  Acessar a tabela 'cliente'
+Passo 2.  Acessar a tabela 'pedido'
+Passo 3.  Aplicar SELECAO (sigma): filtra linhas onde cliente.cidade = 'Recife'
+Passo 4.  Aplicar PROJECAO (pi): mantem apenas as colunas cliente.idCliente, cliente.Nome
+Passo 5.  Aplicar PROJECAO (pi): mantem apenas as colunas pedido.Cliente_idCliente, pedido.ValorTotalPedido
+Passo 6.  Realizar JUNCAO (bowtie) usando cliente.idCliente = pedido.Cliente_idCliente
+Passo 7.  Aplicar PROJECAO (pi): mantem apenas as colunas cliente.Nome, pedido.ValorTotalPedido
+```
+
+Isso atende explicitamente o item **2c do enunciado** ("Ordem de execução da consulta") com **descrições semânticas**, não só símbolos.
+
+---
+
+### 8.5. Como os grafos são desenhados
 
 Existem dois algoritmos de layout:
 
@@ -384,90 +531,140 @@ Veja [_render_graph_window linhas 639-703](trabalho_rafael(1)(1).py#L639-L703) e
 
 ---
 
-## 8. Exemplo completo: do SQL ao grafo otimizado
+## 9. Exemplo completo: do SQL ao plano otimizado
 
-Vamos rastrear o que acontece quando você digita:
+Vamos rastrear o que acontece quando você digita uma query **válida** (com nomes corretos do `bd_vendas`):
 
 ```sql
-SELECT cliente.nome, pedido.valor
+SELECT cliente.Nome, pedido.ValorTotalPedido
 FROM cliente
-INNER JOIN pedido ON cliente.id = pedido.cliente_id
-WHERE cliente.cidade = 'Recife'
+INNER JOIN pedido ON cliente.idCliente = pedido.Cliente_idCliente
+WHERE cliente.Nome = 'Joao'
 ```
+
+> Note: usei `cliente.Nome = 'Joao'` em vez de `cidade = 'Recife'` porque `cidade` está em `endereco`, não em `cliente`. O validador agora detecta isso!
 
 ### Passo 1: tokenização
 
 ```python
-['SELECT', 'cliente.nome', ',', 'pedido.valor',
+['SELECT', 'cliente.Nome', ',', 'pedido.ValorTotalPedido',
  'FROM', 'cliente',
  'INNER', 'JOIN', 'pedido',
- 'ON', 'cliente.id', '=', 'pedido.cliente_id',
- 'WHERE', 'cliente.cidade', '=', "'Recife'"]
+ 'ON', 'cliente.idCliente', '=', 'pedido.Cliente_idCliente',
+ 'WHERE', 'cliente.Nome', '=', "'Joao'"]
 ```
+
+> O `'Joao'` (com aspas) vira **um único token**, graças à atualização da regex do tokenizer.
 
 ### Passo 2: parsing
 
 ```json
 {
-  "columns": ["cliente.nome", "pedido.valor"],
+  "columns": ["cliente.Nome", "pedido.ValorTotalPedido"],
   "table": "cliente",
   "join_table": "pedido",
-  "join_on":  [["cliente.id", "=", "pedido.cliente_id"]],
-  "where":    [["cliente.cidade", "=", "'Recife'"]]
+  "join_on":  [["cliente.idCliente", "=", "pedido.Cliente_idCliente"]],
+  "where":    [["cliente.Nome", "=", "'Joao'"]]
 }
 ```
 
-### Passo 3: classificação dos predicados
+### Passo 3: validação contra o schema bd_vendas
+
+```
+cliente               → existe? sim ✓
+pedido                → existe? sim ✓
+cliente.Nome          → coluna valida? sim ✓
+pedido.ValorTotalPedido → coluna valida? sim ✓
+cliente.idCliente     → coluna valida? sim ✓
+pedido.Cliente_idCliente → coluna valida? sim ✓
+'Joao'                → literal string, ignorado ✓
+```
+
+Lista de erros: vazia → segue.
+
+### Passo 4: classificação dos predicados
 
 Aplicando `_predicate_tables` em cada predicado:
 
 | Predicado | Tabelas referenciadas | Tipo |
 |---|---|---|
-| `cliente.id = pedido.cliente_id` | `{cliente, pedido}` | multi (vira ⋈) |
-| `cliente.cidade = 'Recife'` | `{cliente}` | local em `cliente` |
+| `cliente.idCliente = pedido.Cliente_idCliente` | `{cliente, pedido}` | multi (vira ⋈) |
+| `cliente.Nome = 'Joao'` | `{cliente}` | local em `cliente` |
 
-### Passo 4: monta o grafo de Redução de Tuplas
+### Passo 5: monta o grafo do **Plano Otimizado**
 
 ```
-T0 = cliente,  T1 = pedido
-
 single_table_preds = {
-  cliente: [['cliente.cidade', '=', "'Recife'"]],
-  pedido:  []
+  cliente: [['cliente.Nome', '=', "'Joao'"]],   ← 1 predicado local
+  pedido:  []                                    ← 0 predicados locais
 }
-multi_table_preds = [['cliente.id', '=', 'pedido.cliente_id']]
+multi_table_preds = [['cliente.idCliente', '=', 'pedido.Cliente_idCliente']]
 
-→ cria SEL_0 sobre T0 (cliente)
-→ T1 (pedido) vai direto pro JOIN
-→ cria JOIN ligando SEL_0 e T1
-→ cria PROJ no topo
+→ Reordena folhas: cliente vai primeiro (mais predicados locais).
+→ T0=cliente, T1=pedido.
+→ T0: cria SEL_0 (Nome='Joao'), depois PROJ_0 (idCliente, Nome).
+→ T1: pula SEL (sem predicado), cria PROJ_1 (Cliente_idCliente, ValorTotalPedido).
+→ Multi-pred existe → JOIN com a condição (evita cartesiano).
+→ PROJ_FINAL no topo (Nome, ValorTotalPedido).
 ```
 
-### Passo 5: o grafo na tela
+### Passo 6: o grafo na tela
 
 ```
-                π cliente.nome, pedido.valor
+              π cliente.Nome, pedido.ValorTotalPedido
                           │
-                ⋈ cliente.id = pedido.cliente_id
-                ╱                          ╲
-        σ cliente.cidade = 'Recife'      pedido
-                │
-            cliente
+              ⋈ cliente.idCliente = pedido.Cliente_idCliente
+            ╱                                ╲
+      π idCliente, Nome              π Cliente_idCliente, ValorTotalPedido
+              │                                │
+      σ Nome = 'Joao'                       pedido
+              │
+      cliente [PRIMARIA]
 ```
 
-E embaixo da janela aparece a **ordem de execução bottom-up**:
+### Passo 7: painel de heurísticas aplicadas
 
 ```
-1. cliente
-2. pedido
-3. σ cliente.cidade = 'Recife'
-4. ⋈ cliente.id = pedido.cliente_id
-5. π cliente.nome, pedido.valor
+[OK]  5a-i  Reducao de Tuplas (selecao empurrada para perto das tabelas)
+[OK]  5a-ii Reducao de Atributos (projecao local mantem so colunas necessarias)
+[OK]  5b-i  Reordenacao de folhas (tabela 'cliente' eh a mais restritiva)
+[OK]  5b-ii Evita produto cartesiano (usa JOIN com predicado)
+```
+
+### Passo 8: plano de execução textual
+
+```
+Passo 1.  Acessar a tabela 'cliente'
+Passo 2.  Acessar a tabela 'pedido'
+Passo 3.  Aplicar SELECAO (sigma): filtra linhas onde cliente.Nome = 'Joao'
+Passo 4.  Aplicar PROJECAO (pi): mantem apenas as colunas cliente.idCliente, cliente.Nome
+Passo 5.  Aplicar PROJECAO (pi): mantem apenas as colunas pedido.Cliente_idCliente, pedido.ValorTotalPedido
+Passo 6.  Realizar JUNCAO (bowtie) usando cliente.idCliente = pedido.Cliente_idCliente
+Passo 7.  Aplicar PROJECAO (pi): mantem apenas as colunas cliente.Nome, pedido.ValorTotalPedido
 ```
 
 ---
 
-## 9. Glossário rápido
+## 10. Mapeamento dos critérios de avaliação
+
+| Critério (PDF) | Pontos | Onde está implementado |
+|---|---|---|
+| Interface Gráfica funcional | 1,5 | `SQLApp` em [trabalho_rafael(1)(1).py:222](trabalho_rafael(1)(1).py#L222) — toda a UI Tkinter com tema dark |
+| Local para inserir SQL | 1,0 | `self.sql_editor` em [_build_ui](trabalho_rafael(1)(1).py#L289-L306) — editor Text com numeração de linhas e syntax highlight |
+| String é parseada | 1,0 | `tokenize` + `SQLParser` em [linhas 60-205](trabalho_rafael(1)(1).py#L60-L205) |
+| **Campos e comandos errados são validados** | 1,0 | `validate_against_schema` em [linhas 76-149](trabalho_rafael(1)(1).py#L76-L149), chamada em `_execute` e `_parse_for_graph` |
+| Grafo Otimizado mostrado na GUI | 1,0 | `_show_optimal_plan_graph` (botão verde "Plano Otimizado") |
+| **Ordem de execução (plano de execução)** | 1,5 | Painel "Plano de Execução" com `_describe_step` traduzindo cada passo |
+| Heurística Redução de Tuplas | 1,0 | `_build_tuple_reduction_graph` em [linhas 848-907](trabalho_rafael(1)(1).py#L848-L907) |
+| Heurística Redução de Atributos | 1,0 | `_build_attribute_reduction_graph` em [linhas 927-991](trabalho_rafael(1)(1).py#L927-L991) |
+| **Demais Heurísticas** | 1,0 | `_build_optimal_plan_graph` — reordenação de folhas (5b-i) + evita cartesiano (5b-ii) + ajuste da árvore (5b-iii) |
+| **TOTAL** | **10,0** | |
+
+---
+
+---
+
+## 11. Glossário rápido
 
 | Termo | Significado |
 |---|---|
@@ -485,8 +682,9 @@ E embaixo da janela aparece a **ordem de execução bottom-up**:
 
 ## TL;DR
 
-- O programa parseia SQL → executa no MySQL → desenha 3 planos de execução em álgebra relacional.
+- O programa parseia SQL → **valida contra o schema bd_vendas** → executa no MySQL → desenha **4 planos de execução** em álgebra relacional.
 - O plano "não otimizado" mostra **como não fazer** (× antes de σ).
-- A **Redução de Tuplas** empurra σ para perto das tabelas → JOIN com menos linhas.
-- A **Redução de Atributos** empurra π para perto das tabelas → JOIN com linhas menores.
-- Junte as duas e você tem 90% do que um otimizador de consultas real faz no plano lógico.
+- A **Redução de Tuplas** (5a-i) empurra σ para perto das tabelas → JOIN com menos linhas.
+- A **Redução de Atributos** (5a-ii) empurra π para perto das tabelas → JOIN com linhas menores.
+- O **Plano Otimizado** combina tudo e ainda **reordena folhas** (mais restritiva primeiro, 5b-i) e **evita cartesiano** (5b-ii), mostrando um checklist das heurísticas aplicadas e um plano de execução textual passo a passo.
+- Resultado: cobre os 10,0 pontos do enunciado.

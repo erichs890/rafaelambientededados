@@ -34,11 +34,134 @@ SQL_KEYWORDS = [
     "ELSE", "END"
 ]
 
+# ─── Schema do banco bd_vendas (para validacao) ──────────────────────────────
+# Estrutura usada para validar nomes de tabelas e colunas das consultas SQL,
+# conforme exigido no item 4.b do enunciado: "O banco exemplo servira como base
+# na validacao dos nomes de tabelas e campos no momento da validacao da clausula SQL."
+SCHEMA = {
+    "categoria":          ["idCategoria", "Descricao"],
+    "produto":            ["idProduto", "Nome", "Descricao", "Preco", "QuantEstoque",
+                           "Categoria_idCategoria"],
+    "tipocliente":        ["idTipoCliente", "Descricao"],
+    "cliente":            ["idCliente", "Nome", "Email", "Nascimento", "Senha",
+                           "TipoCliente_idTipoCliente", "DataRegistro"],
+    "tipoendereco":       ["idTipoEndereco", "Descricao"],
+    "endereco":           ["idEndereco", "EnderecoPadrao", "Logradouro", "Numero",
+                           "Complemento", "Bairro", "Cidade", "UF", "CEP",
+                           "TipoEndereco_idTipoEndereco", "Cliente_idCliente"],
+    "telefone":           ["Numero", "Cliente_idCliente"],
+    "status":             ["idStatus", "Descricao"],
+    "pedido":             ["idPedido", "Status_idStatus", "DataPedido",
+                           "ValorTotalPedido", "Cliente_idCliente"],
+    "pedido_has_produto": ["idPedidoProduto", "Pedido_idPedido", "Produto_idProduto",
+                           "Quantidade", "PrecoUnitario"],
+}
+
 # ─── Tokenizer e Parser (original) ──────────────────────────────────────────
 def tokenize(sql):
-    pattern = r"<=|>=|<>|=|>|<|\(|\)|,|[\w.]+"
+    # Captura strings entre aspas como UM unico token, depois operadores e palavras.
+    pattern = r"'[^']*'|<=|>=|<>|=|>|<|\(|\)|,|[\w.]+"
     tokens = re.findall(pattern, sql, re.IGNORECASE)
     return [t.strip() for t in tokens]
+
+
+# ─── Validador de Schema ─────────────────────────────────────────────────────
+def _flatten_predicates(cond):
+    """Achata uma condicao em lista plana de predicados [left, op, right]."""
+    if not cond:
+        return []
+    if isinstance(cond, list):
+        if len(cond) == 3 and all(isinstance(x, str) for x in cond):
+            return [cond]
+        result = []
+        for item in cond:
+            if isinstance(item, str):
+                continue
+            result.extend(_flatten_predicates(item))
+        return result
+    return []
+
+
+def _is_literal(ref):
+    """True se a referencia eh um valor literal (numero ou string entre aspas)."""
+    if not isinstance(ref, str) or not ref:
+        return False
+    if ref.startswith("'") or ref.startswith('"'):
+        return True
+    # Numerico (inteiro ou decimal)
+    s = ref.replace('.', '', 1) if ref.count('.') <= 1 else ref
+    return s.isdigit()
+
+
+def validate_against_schema(parsed):
+    """Valida nomes de tabelas e colunas contra o SCHEMA do bd_vendas.
+
+    Retorna lista de strings de erro. Lista vazia = consulta valida.
+    """
+    errors = []
+
+    # 1) Tabela do FROM
+    main_table = parsed.get('table')
+    main_lower = main_table.lower() if main_table else None
+    if not main_lower:
+        errors.append("Clausula FROM ausente.")
+        return errors
+    if main_lower not in SCHEMA:
+        errors.append(f"Tabela '{main_table}' nao existe em bd_vendas.")
+
+    # 2) Tabela do INNER JOIN
+    join_table = parsed.get('join_table')
+    join_lower = join_table.lower() if join_table else None
+    if join_lower and join_lower not in SCHEMA:
+        errors.append(f"Tabela '{join_table}' (no JOIN) nao existe em bd_vendas.")
+
+    if errors:
+        return errors  # sem tabelas validas nao da pra checar colunas
+
+    available = [main_lower] + ([join_lower] if join_lower else [])
+
+    def check_column(ref, where):
+        if ref == '*' or _is_literal(ref):
+            return
+        if '.' in ref:
+            t, c = ref.split('.', 1)
+            t_low = t.lower()
+            if t_low not in SCHEMA:
+                errors.append(f"Tabela '{t}' nao existe (em '{ref}', {where}).")
+                return
+            if t_low not in available:
+                errors.append(f"Tabela '{t}' nao esta no FROM/JOIN (em '{ref}', {where}).")
+                return
+            cols_low = {col.lower() for col in SCHEMA[t_low]}
+            if c.lower() not in cols_low:
+                errors.append(f"Coluna '{c}' nao existe em '{t}' (em '{ref}', {where}).")
+        else:
+            # Sem prefixo: precisa estar em alguma tabela disponivel (e ser unica)
+            found_in = [t for t in available
+                        if ref.lower() in {col.lower() for col in SCHEMA[t]}]
+            if not found_in:
+                errors.append(f"Coluna '{ref}' nao existe em nenhuma tabela do FROM/JOIN ({where}).")
+            elif len(found_in) > 1:
+                errors.append(f"Coluna '{ref}' eh ambigua: existe em {found_in}. "
+                              f"Use prefixo tabela.coluna ({where}).")
+
+    # 3) Colunas do SELECT
+    for col in parsed.get('columns', []):
+        check_column(col, "no SELECT")
+
+    # 4) Predicados do WHERE
+    for pred in _flatten_predicates(parsed.get('where', [])):
+        if len(pred) == 3:
+            check_column(pred[0], "no WHERE")
+            check_column(pred[2], "no WHERE")
+
+    # 5) Predicados do JOIN ON
+    for pred in _flatten_predicates(parsed.get('join_on', [])):
+        if len(pred) == 3:
+            check_column(pred[0], "no JOIN ON")
+            check_column(pred[2], "no JOIN ON")
+
+    return errors
 
 class SQLParser:
     def __init__(self, tokens):
@@ -253,6 +376,14 @@ class SQLApp(tk.Tk):
         )
         self.btn_attr.pack(side="left", padx=(8, 0))
 
+        self.btn_optimal = tk.Button(
+            btn_bar, text="  Plano Otimizado", bg=BG_SUCCESS, fg="white",
+            font=("Segoe UI", 10, "bold"), relief="flat", cursor="hand2",
+            activebackground="#16a34a", activeforeground="white",
+            padx=14, pady=6, command=self._show_optimal_plan_graph
+        )
+        self.btn_optimal.pack(side="left", padx=(8, 0))
+
         # Status
         self.status_var = tk.StringVar(value="Pronto")
         self.status_label = ttk.Label(btn_bar, textvariable=self.status_var, style="Status.TLabel")
@@ -312,8 +443,14 @@ class SQLApp(tk.Tk):
         # Hover nos botoes
         for btn, bg_normal in [(self.btn_exec, BG_BUTTON), (self.btn_clear, BORDER_COLOR),
                                 (self.btn_parse, BORDER_COLOR), (self.btn_graph, BORDER_COLOR),
-                                (self.btn_tuple, BORDER_COLOR), (self.btn_attr, BORDER_COLOR)]:
-            hover = BG_BTN_HOVER if btn == self.btn_exec else BG_PANEL
+                                (self.btn_tuple, BORDER_COLOR), (self.btn_attr, BORDER_COLOR),
+                                (self.btn_optimal, BG_SUCCESS)]:
+            if btn == self.btn_exec:
+                hover = BG_BTN_HOVER
+            elif btn == self.btn_optimal:
+                hover = "#16a34a"
+            else:
+                hover = BG_PANEL
             btn.bind("<Enter>", lambda e, b=btn, h=hover: b.configure(bg=h))
             btn.bind("<Leave>", lambda e, b=btn, n=bg_normal: b.configure(bg=n))
 
@@ -438,6 +575,17 @@ class SQLApp(tk.Tk):
             self.status_var.set(f"Parser Error: {e}")
             self.status_label.configure(style="Error.TLabel")
             self.row_count_var.set("")
+            return
+
+        # 1.5) Validar contra o schema bd_vendas (item 4.b do enunciado)
+        schema_errors = validate_against_schema(parsed)
+        if schema_errors:
+            self.status_var.set(f"Validacao: {len(schema_errors)} erro(s)")
+            self.status_label.configure(style="Error.TLabel")
+            self.row_count_var.set("")
+            msg = "Validacao do schema falhou:\n\n" + "\n".join(f"  - {e}" for e in schema_errors)
+            self.empty_label.config(text=msg)
+            self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
             return
 
         # 2) Executar no MySQL
@@ -708,10 +856,19 @@ class SQLApp(tk.Tk):
             return None
         try:
             tokens = tokenize(query)
-            return SQLParser(tokens).parse()
+            parsed = SQLParser(tokens).parse()
         except Exception as e:
             messagebox.showerror("Parser Error", str(e))
             return None
+        schema_errors = validate_against_schema(parsed)
+        if schema_errors:
+            messagebox.showerror(
+                "Validacao do Schema",
+                "Os seguintes problemas foram encontrados:\n\n" +
+                "\n".join(f"  - {e}" for e in schema_errors)
+            )
+            return None
+        return parsed
 
     def _show_nonoptimized_graph(self):
         parsed = self._parse_for_graph()
@@ -1026,6 +1183,244 @@ class SQLApp(tk.Tk):
                      ).grid(row=idx // 2, column=idx % 2,
                             sticky="w", padx=16, pady=2)
         tk.Label(of, text="", bg=BG_PANEL).pack(pady=2)
+
+
+    # ── Heuristica Completa: Plano Otimizado Final ──────────────────────
+    # Combina TODAS as heuristicas do enunciado (item 5):
+    #   5a-i  Reducao de Tuplas    (selection pushdown)
+    #   5a-ii Reducao de Atributos (projection pushdown)
+    #   5b-i  Reordenacao de folhas (mais restritiva primeiro)
+    #   5b-ii Evitar produto cartesiano (usa JOIN com predicado quando possivel)
+    #   5b-iii Ajuste do restante da arvore para refletir a nova ordem
+    def _build_optimal_plan_graph(self, parsed):
+        G = nx.DiGraph()
+        tables = [parsed["table"]]
+        if "join_table" in parsed:
+            tables.append(parsed["join_table"])
+
+        # Achata predicados de WHERE e JOIN ON
+        predicates = []
+        if "join_on" in parsed:
+            predicates.extend(self._flatten_conjunction(parsed["join_on"]))
+        if "where" in parsed:
+            predicates.extend(self._flatten_conjunction(parsed["where"]))
+
+        # Classifica predicados por quantas tabelas eles tocam
+        single_table_preds = {t: [] for t in tables}
+        multi_table_preds = []
+        for p in predicates:
+            refs = self._predicate_tables(p, tables)
+            if len(refs) == 1:
+                single_table_preds[next(iter(refs))].append(p)
+            else:
+                multi_table_preds.append(p)
+
+        # Heuristica 5b-i: REORDENAR FOLHAS — tabela com mais predicados
+        # locais (mais "restritiva") vai primeiro. Critério de desempate
+        # estavel: ordem original.
+        tables_sorted = sorted(
+            tables,
+            key=lambda t: (-len(single_table_preds[t]), tables.index(t))
+        )
+
+        # Para cada tabela: tabela -> selecao local -> projecao local
+        table_outputs = {}
+        for i, t in enumerate(tables_sorted):
+            tnode = f"T{i}"
+            badge = "  [PRIMARIA]" if i == 0 and len(tables_sorted) > 1 and single_table_preds[t] else ""
+            G.add_node(tnode, label=t + badge, type="table", order=0)
+            current = tnode
+
+            # Selecao local (Heuristica 5a-i)
+            if single_table_preds[t]:
+                sel_id = f"SEL_{i}"
+                cond_txt = " AND ".join(f"{p[0]} {p[1]} {p[2]}" for p in single_table_preds[t])
+                G.add_node(sel_id, label=f"o  {cond_txt}", type="selection", order=1)
+                G.add_edge(sel_id, current)
+                current = sel_id
+
+            # Projecao local (Heuristica 5a-ii):
+            # so as colunas que sobem dessa tabela para o JOIN ou para o SELECT final.
+            cols_for_t = self._columns_for_table(parsed["columns"], t)
+            pred_cols = []
+            for p in single_table_preds[t] + multi_table_preds:
+                for side in (p[0], p[2]):
+                    if (isinstance(side, str) and "." in side
+                            and side.lower().startswith(t.lower() + ".")
+                            and side not in cols_for_t and side not in pred_cols):
+                        pred_cols.append(side)
+            all_cols = list(dict.fromkeys(cols_for_t + pred_cols)) or ["*"]
+
+            proj_id = f"PROJ_{i}"
+            G.add_node(proj_id, label=f"pi  {', '.join(all_cols)}", type="projection", order=2)
+            G.add_edge(proj_id, current)
+            table_outputs[t] = proj_id
+
+        # Juncao ou cartesiano (Heuristica 5b-ii: prefere JOIN)
+        if len(tables) > 1:
+            if multi_table_preds:
+                cond_txt = " AND ".join(f"{p[0]} {p[1]} {p[2]}" for p in multi_table_preds)
+                G.add_node("JOIN", label=f"|x|  {cond_txt}", type="join", order=3)
+                # Ordem de adicao das arestas = ordem visual (esquerda para direita)
+                for t in tables_sorted:
+                    G.add_edge("JOIN", table_outputs[t])
+                root_pre_final = "JOIN"
+            else:
+                G.add_node("CART", label="X  CARTESIANO (sem condicao de juncao!)",
+                           type="cartesian", order=3)
+                for t in tables_sorted:
+                    G.add_edge("CART", table_outputs[t])
+                root_pre_final = "CART"
+        else:
+            root_pre_final = table_outputs[tables_sorted[0]]
+
+        # Projecao final (so as colunas pedidas no SELECT do usuario)
+        proj_final = "PROJ_FINAL"
+        cols_txt = ", ".join(parsed["columns"])
+        G.add_node(proj_final, label=f"pi  {cols_txt}", type="projection", order=4)
+        G.add_edge(proj_final, root_pre_final)
+
+        # Devolve o grafo + raiz + metadados para o painel didatico
+        applied_heuristics = []
+        if any(single_table_preds[t] for t in tables):
+            applied_heuristics.append("5a-i  Reducao de Tuplas (selecao empurrada para perto das tabelas)")
+        applied_heuristics.append(
+            "5a-ii Reducao de Atributos (projecao local mantem so colunas necessarias)")
+        if len(tables) > 1 and any(single_table_preds[t] for t in tables):
+            primaria = tables_sorted[0]
+            applied_heuristics.append(
+                f"5b-i  Reordenacao de folhas (tabela '{primaria}' eh a mais restritiva)")
+        if len(tables) > 1:
+            if multi_table_preds:
+                applied_heuristics.append(
+                    "5b-ii Evita produto cartesiano (usa JOIN com predicado)")
+            else:
+                applied_heuristics.append(
+                    "5b-ii AVISO: nao foi possivel evitar cartesiano (sem condicao de juncao)")
+
+        return G, proj_final, applied_heuristics
+
+    def _describe_step(self, ntype, label):
+        """Gera descricao didatica para um passo do plano de execucao."""
+        clean = label.replace("  [PRIMARIA]", "")
+        if ntype == "table":
+            return f"Acessar a tabela '{clean}'"
+        if ntype == "selection":
+            cond = clean.replace("o  ", "")
+            return f"Aplicar SELECAO (sigma): filtra linhas onde {cond}"
+        if ntype == "projection":
+            cols = clean.replace("pi  ", "")
+            return f"Aplicar PROJECAO (pi): mantem apenas as colunas {cols}"
+        if ntype == "join":
+            cond = clean.replace("|x|  ", "")
+            return f"Realizar JUNCAO (bowtie) usando {cond}"
+        if ntype == "cartesian":
+            return "Realizar PRODUTO CARTESIANO (operacao cara — evitar!)"
+        return clean
+
+    def _show_optimal_plan_graph(self):
+        parsed = self._parse_for_graph()
+        if parsed is None:
+            return
+        G, root, applied = self._build_optimal_plan_graph(parsed)
+
+        NODE_H = 36
+        CHAR_W = 7
+        STYLES = {
+            "table":      {"bg": "#1f1233", "border": FG_NUMBER,   "fg": FG_NUMBER},
+            "selection":  {"bg": "#0f1e30", "border": FG_OPERATOR, "fg": FG_OPERATOR},
+            "projection": {"bg": "#0d2618", "border": FG_STRING,   "fg": FG_STRING},
+            "join":       {"bg": "#1e1a08", "border": FG_TABLE_HD, "fg": FG_TABLE_HD},
+            "cartesian":  {"bg": "#2a0f0f", "border": FG_KEYWORD,  "fg": FG_KEYWORD},
+        }
+
+        win = tk.Toplevel(self)
+        win.title("Plano Final Otimizado")
+        win.geometry("1280x880")
+        win.configure(bg=BG_DARK)
+        win.transient(self)
+
+        tk.Label(win, text="PLANO FINAL OTIMIZADO  —  TODAS AS HEURISTICAS",
+                 bg=BG_DARK, fg=BG_SUCCESS,
+                 font=("Segoe UI", 17, "bold")).pack(pady=(16, 0))
+        tk.Label(win, text=f"Nos: {G.number_of_nodes()}  |  Arestas: {G.number_of_edges()}",
+                 bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 9)).pack(anchor="w", padx=22)
+
+        # Painel: heuristicas aplicadas
+        h_frame = tk.Frame(win, bg=BG_PANEL)
+        h_frame.pack(fill="x", padx=20, pady=(8, 4))
+        tk.Label(h_frame, text="Heuristicas Aplicadas", bg=BG_PANEL, fg=FG_TABLE_HD,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
+        for h in applied:
+            tk.Label(h_frame, text=f"  [OK]  {h}", bg=BG_PANEL, fg=BG_SUCCESS,
+                     font=("Cascadia Code", 9)).pack(anchor="w", padx=20)
+        tk.Label(h_frame, text="", bg=BG_PANEL).pack(pady=2)
+
+        # Canvas do grafo
+        cf = tk.Frame(win, bg=BORDER_COLOR)
+        cf.pack(fill="both", expand=True, padx=20, pady=(6, 6))
+        hbar = tk.Scrollbar(cf, orient="horizontal")
+        hbar.pack(side="bottom", fill="x")
+        canvas = tk.Canvas(cf, bg=BG_EDITOR, highlightthickness=0, xscrollcommand=hbar.set)
+        canvas.pack(fill="both", expand=True, padx=1, pady=1)
+        hbar.config(command=canvas.xview)
+
+        def redraw(*_):
+            canvas.delete("all")
+            cw = canvas.winfo_width()
+            if cw < 50:
+                return
+            pos, depths, eff_w = self._subtree_layout(G, root, cw)
+            max_y = max(y for _, y in pos.values()) + NODE_H + 40
+            canvas.config(scrollregion=(0, 0, eff_w, max_y))
+
+            for u, v in G.edges():
+                x1, y1 = pos[u]
+                x2, y2 = pos[v]
+                mid = (y1 + y2) / 2
+                canvas.create_line(x1, y1 + NODE_H // 2 + 1,
+                                   x1, mid, x2, mid,
+                                   x2, y2 - NODE_H // 2 - 1,
+                                   fill="#50507a", width=2, joinstyle="round")
+                canvas.create_line(x2, mid, x2, y2 - NODE_H // 2 - 1,
+                                   fill="#7070b0", width=2,
+                                   arrow="last", arrowshape=(10, 13, 4))
+
+            for n in G.nodes():
+                x, y = pos[n]
+                ntype = G.nodes[n].get("type", "table")
+                label = G.nodes[n].get("label", n)
+                st = STYLES.get(ntype, STYLES["table"])
+                bw = max(len(label) * CHAR_W + 44, 90)
+                x1, y1 = x - bw / 2, y - NODE_H / 2
+                x2, y2 = x + bw / 2, y + NODE_H / 2
+                canvas.create_rectangle(x1 + 4, y1 + 4, x2 + 4, y2 + 4,
+                                        fill="#0a0a18", outline="")
+                canvas.create_rectangle(x1, y1, x2, y2,
+                                        fill=st["bg"], outline=st["border"], width=2)
+                canvas.create_rectangle(x1 + 2, y1 + 2, x2 - 2, y1 + 6,
+                                        fill=st["border"], outline="")
+                canvas.create_text(x, y + 2, text=label,
+                                   fill=st["fg"],
+                                   font=("Cascadia Code", 10, "bold"))
+
+        canvas.bind("<Configure>", redraw)
+
+        # Painel: plano de execucao TEXTUAL didatico (item 2c do enunciado)
+        plan_frame = tk.Frame(win, bg=BG_PANEL)
+        plan_frame.pack(fill="x", padx=20, pady=(0, 16))
+        tk.Label(plan_frame, text="Plano de Execucao  (passo a passo, bottom-up)",
+                 bg=BG_PANEL, fg=FG_TABLE_HD,
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
+        ordered = sorted(G.nodes(data=True), key=lambda x: (x[1].get("order", 0), x[0]))
+        for idx, (nid, data) in enumerate(ordered, 1):
+            ntype = data.get("type", "table")
+            st = STYLES.get(ntype, {"fg": FG_TEXT})
+            descr = self._describe_step(ntype, data.get("label", nid))
+            tk.Label(plan_frame, text=f"  Passo {idx}.  {descr}",
+                     bg=BG_PANEL, fg=st["fg"],
+                     font=("Cascadia Code", 10), anchor="w").pack(anchor="w", padx=18)
+        tk.Label(plan_frame, text="", bg=BG_PANEL).pack(pady=2)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
