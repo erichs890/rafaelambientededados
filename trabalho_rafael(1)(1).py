@@ -140,16 +140,17 @@ def validate_against_schema(parsed):
     if main_lower not in SCHEMA:
         errors.append(f"Tabela '{main_table}' nao existe em bd_vendas.")
 
-    # 2) Tabela do INNER JOIN
-    join_table = parsed.get('join_table')
-    join_lower = join_table.lower() if join_table else None
-    if join_lower and join_lower not in SCHEMA:
-        errors.append(f"Tabela '{join_table}' (no JOIN) nao existe em bd_vendas.")
+    # 2) Tabelas dos INNER JOINs (suporta N joins)
+    joins = parsed.get('joins', [])
+    for j in joins:
+        jt = j.get('table')
+        if jt and jt.lower() not in SCHEMA:
+            errors.append(f"Tabela '{jt}' (no JOIN) nao existe em bd_vendas.")
 
     if errors:
         return errors  # sem tabelas validas nao da pra checar colunas
 
-    available = [main_lower] + ([join_lower] if join_lower else [])
+    available = [main_lower] + [j['table'].lower() for j in joins if j.get('table')]
 
     def check_column(ref, where):
         if ref == '*' or _is_literal(ref):
@@ -186,11 +187,12 @@ def validate_against_schema(parsed):
             check_column(pred[0], "no WHERE")
             check_column(pred[2], "no WHERE")
 
-    # 5) Predicados do JOIN ON
-    for pred in _flatten_predicates(parsed.get('join_on', [])):
-        if len(pred) == 3:
-            check_column(pred[0], "no JOIN ON")
-            check_column(pred[2], "no JOIN ON")
+    # 5) Predicados de cada JOIN ON
+    for j in joins:
+        for pred in _flatten_predicates(j.get('on', [])):
+            if len(pred) == 3:
+                check_column(pred[0], "no JOIN ON")
+                check_column(pred[2], "no JOIN ON")
 
     return errors
 
@@ -217,13 +219,17 @@ class SQLParser:
         data['columns'] = self.parse_list()
         self.consume("FROM")
         data['table'] = self.consume()
-        if self.peek() and self.peek().upper() == "INNER":
+        # Suporta N INNER JOINs encadeados; cada um vira {'table', 'on'}
+        data['joins'] = []
+        while self.peek() and self.peek().upper() == "INNER":
             self.consume("INNER")
             self.consume("JOIN")
-            data['join_table'] = self.consume()
+            join_table = self.consume()
+            join_on = []
             if self.peek() and self.peek().upper() == "ON":
                 self.consume("ON")
-                data['join_on'] = self.parse_condition()
+                join_on = self.parse_condition()
+            data['joins'].append({'table': join_table, 'on': join_on})
         if self.peek() and self.peek().upper() == "WHERE":
             self.consume("WHERE")
             data['where'] = self.parse_condition()
@@ -933,8 +939,8 @@ class SQLApp(tk.Tk):
         G = nx.DiGraph()
 
         tables = [parsed["table"]]
-        if "join_table" in parsed:
-            tables.append(parsed["join_table"])
+        for j in parsed.get('joins', []):
+            tables.append(j['table'])
 
         table_nodes = []
         for i, t in enumerate(tables):
@@ -954,8 +960,9 @@ class SQLApp(tk.Tk):
             current = table_nodes[0]
 
         conditions = []
-        if "join_on" in parsed:
-            conditions.append(self._format_condition(parsed["join_on"]))
+        for j in parsed.get('joins', []):
+            if j.get('on'):
+                conditions.append(self._format_condition(j['on']))
         if "where" in parsed:
             conditions.append(self._format_condition(parsed["where"]))
         conditions = [c for c in conditions if c]
@@ -1120,12 +1127,13 @@ class SQLApp(tk.Tk):
         G = nx.DiGraph()
 
         tables = [parsed["table"]]
-        if "join_table" in parsed:
-            tables.append(parsed["join_table"])
+        for j in parsed.get('joins', []):
+            tables.append(j['table'])
 
         predicates = []
-        if "join_on" in parsed:
-            predicates.extend(self._flatten_conjunction(parsed["join_on"]))
+        for j in parsed.get('joins', []):
+            if j.get('on'):
+                predicates.extend(self._flatten_conjunction(j['on']))
         if "where" in parsed:
             predicates.extend(self._flatten_conjunction(parsed["where"]))
 
@@ -1198,12 +1206,13 @@ class SQLApp(tk.Tk):
     def _build_attribute_reduction_graph(self, parsed):
         G = nx.DiGraph()
         tables = [parsed["table"]]
-        if "join_table" in parsed:
-            tables.append(parsed["join_table"])
+        for j in parsed.get('joins', []):
+            tables.append(j['table'])
 
         predicates = []
-        if "join_on" in parsed:
-            predicates.extend(self._flatten_conjunction(parsed["join_on"]))
+        for j in parsed.get('joins', []):
+            if j.get('on'):
+                predicates.extend(self._flatten_conjunction(j['on']))
         if "where" in parsed:
             predicates.extend(self._flatten_conjunction(parsed["where"]))
 
@@ -1421,13 +1430,14 @@ class SQLApp(tk.Tk):
     def _build_optimal_plan_graph(self, parsed):
         G = nx.DiGraph()
         tables = [parsed["table"]]
-        if "join_table" in parsed:
-            tables.append(parsed["join_table"])
+        for j in parsed.get('joins', []):
+            tables.append(j['table'])
 
-        # Achata predicados de WHERE e JOIN ON
+        # Achata predicados de WHERE e JOIN ON (de todos os JOINs)
         predicates = []
-        if "join_on" in parsed:
-            predicates.extend(self._flatten_conjunction(parsed["join_on"]))
+        for j in parsed.get('joins', []):
+            if j.get('on'):
+                predicates.extend(self._flatten_conjunction(j['on']))
         if "where" in parsed:
             predicates.extend(self._flatten_conjunction(parsed["where"]))
 
