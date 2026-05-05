@@ -1,9 +1,39 @@
 import re
+import os
 import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
 import mysql.connector
 import json
 import networkx as nx
+
+# ─── Configuracao de conexao MySQL ───────────────────────────────────────────
+# Carregada de db_config.json se existir, senao usa defaults.
+# Pode ser editada em runtime pelo botao "Conexao BD".
+DB_CONFIG = {
+    "host":     "localhost",
+    "user":     "root",
+    "password": "132654",
+    "database": "bd_vendas",
+}
+_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db_config.json")
+
+def _load_db_config():
+    if os.path.exists(_CONFIG_FILE):
+        try:
+            with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+                DB_CONFIG.update(json.load(f))
+        except Exception:
+            pass
+
+def _save_db_config():
+    try:
+        with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(DB_CONFIG, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+_load_db_config()
 
 # ─── Cores do tema ───────────────────────────────────────────────────────────
 BG_DARK      = "#1e1e2e"
@@ -59,8 +89,9 @@ SCHEMA = {
 
 # ─── Tokenizer e Parser (original) ──────────────────────────────────────────
 def tokenize(sql):
-    # Captura strings entre aspas como UM unico token, depois operadores e palavras.
-    pattern = r"'[^']*'|<=|>=|<>|=|>|<|\(|\)|,|[\w.]+"
+    # Captura strings entre aspas como UM unico token, depois operadores,
+    # asterisco (SELECT *), pontuacao e palavras/identificadores qualificados.
+    pattern = r"'[^']*'|<=|>=|<>|=|>|<|\(|\)|,|\*|[\w.]+"
     tokens = re.findall(pattern, sql, re.IGNORECASE)
     return [t.strip() for t in tokens]
 
@@ -236,9 +267,9 @@ class SQLApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SQL Query Studio")
-        self.geometry("1100x750")
+        self.geometry("1100x800")
         self.configure(bg=BG_DARK)
-        self.minsize(900, 600)
+        self.minsize(720, 580)
 
         self._build_styles()
         self._build_ui()
@@ -281,14 +312,46 @@ class SQLApp(tk.Tk):
 
     # ── Interface ────────────────────────────────────────────────────────
     def _build_ui(self):
+        # ── Container scrollavel principal ───────────────────────────────
+        # Tudo vai dentro de um Canvas com scrollbar vertical, para que
+        # o usuario possa rolar quando a janela for menor que o conteudo.
+        self._main_canvas = tk.Canvas(self, bg=BG_DARK, highlightthickness=0)
+        self._main_vscroll = ttk.Scrollbar(self, orient="vertical",
+                                           command=self._main_canvas.yview)
+        self._main_canvas.configure(yscrollcommand=self._main_vscroll.set)
+        self._main_vscroll.pack(side="right", fill="y")
+        self._main_canvas.pack(side="left", fill="both", expand=True)
+
+        scrollable = ttk.Frame(self._main_canvas, style="Dark.TFrame")
+        self._scroll_window_id = self._main_canvas.create_window(
+            (0, 0), window=scrollable, anchor="nw")
+
+        scrollable.bind(
+            "<Configure>",
+            lambda e: self._main_canvas.configure(
+                scrollregion=self._main_canvas.bbox("all"))
+        )
+        self._main_canvas.bind(
+            "<Configure>",
+            lambda e: self._main_canvas.itemconfig(
+                self._scroll_window_id, width=e.width)
+        )
+
+        # Mouse wheel: rola o canvas APENAS quando o cursor estiver na janela
+        # principal. Janelas de grafo (Toplevel) tem seu proprio scroll vertical.
+        def _on_mousewheel(e):
+            if e.widget.winfo_toplevel() is self:
+                self._main_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        self._main_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
         # Header
-        header = ttk.Frame(self, style="Dark.TFrame")
+        header = ttk.Frame(scrollable, style="Dark.TFrame")
         header.pack(fill="x", padx=20, pady=(18, 0))
         ttk.Label(header, text="SQL Query Studio", style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="Parser + MySQL  |  bd_vendas", style="Subtitle.TLabel").pack(side="left", padx=(12, 0), pady=(6, 0))
 
         # ── Editor area ─────────────────────────────────────────────────
-        editor_frame = ttk.Frame(self, style="Dark.TFrame")
+        editor_frame = ttk.Frame(scrollable, style="Dark.TFrame")
         editor_frame.pack(fill="x", padx=20, pady=(14, 0))
 
         ttk.Label(editor_frame, text="EDITOR SQL", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
@@ -325,11 +388,16 @@ class SQLApp(tk.Tk):
         self.sql_editor.tag_configure("placeholder", foreground=FG_DIM)
 
         # ── Botoes ───────────────────────────────────────────────────────
-        btn_bar = ttk.Frame(self, style="Dark.TFrame")
-        btn_bar.pack(fill="x", padx=20, pady=(10, 0))
+        # Container externo para as duas linhas de botoes
+        btn_outer = ttk.Frame(scrollable, style="Dark.TFrame")
+        btn_outer.pack(fill="x", padx=20, pady=(10, 0))
+
+        # Linha 1: Acoes principais (Executar / Limpar / Conexao BD)
+        action_row = ttk.Frame(btn_outer, style="Dark.TFrame")
+        action_row.pack(fill="x")
 
         self.btn_exec = tk.Button(
-            btn_bar, text="  Executar  (Ctrl+Enter)", bg=BG_BUTTON, fg="white",
+            action_row, text="  Executar  (Ctrl+Enter)", bg=BG_BUTTON, fg="white",
             font=("Segoe UI", 10, "bold"), relief="flat", cursor="hand2",
             activebackground=BG_BTN_HOVER, activeforeground="white",
             padx=18, pady=6, command=self._execute
@@ -337,23 +405,41 @@ class SQLApp(tk.Tk):
         self.btn_exec.pack(side="left")
 
         self.btn_clear = tk.Button(
-            btn_bar, text="  Limpar", bg=BORDER_COLOR, fg=FG_TEXT,
+            action_row, text="  Limpar", bg=BORDER_COLOR, fg=FG_TEXT,
             font=("Segoe UI", 10), relief="flat", cursor="hand2",
             activebackground=BG_PANEL, activeforeground=FG_TEXT,
             padx=14, pady=6, command=self._clear
         )
         self.btn_clear.pack(side="left", padx=(8, 0))
 
+        self.btn_config = tk.Button(
+            action_row, text="  Conexao BD", bg=BORDER_COLOR, fg=FG_TEXT,
+            font=("Segoe UI", 10), relief="flat", cursor="hand2",
+            activebackground=BG_PANEL, activeforeground=FG_TEXT,
+            padx=14, pady=6, command=self._show_db_config
+        )
+        self.btn_config.pack(side="left", padx=(8, 0))
+
+        # Contador de linhas (canto direito da linha 1)
+        self.row_count_var = tk.StringVar()
+        self.row_count_label = ttk.Label(action_row, textvariable=self.row_count_var,
+                                          style="Status.TLabel")
+        self.row_count_label.pack(side="right", padx=(8, 0))
+
+        # Linha 2: Analise / visualizacoes (5 botoes)
+        analysis_row = ttk.Frame(btn_outer, style="Dark.TFrame")
+        analysis_row.pack(fill="x", pady=(8, 0))
+
         self.btn_parse = tk.Button(
-            btn_bar, text="  Analisar Parser", bg=BORDER_COLOR, fg=FG_TEXT,
+            analysis_row, text="  Analisar Parser", bg=BORDER_COLOR, fg=FG_TEXT,
             font=("Segoe UI", 10), relief="flat", cursor="hand2",
             activebackground=BG_PANEL, activeforeground=FG_TEXT,
             padx=14, pady=6, command=self._show_parse_tree
         )
-        self.btn_parse.pack(side="left", padx=(8, 0))
+        self.btn_parse.pack(side="left")
 
         self.btn_graph = tk.Button(
-            btn_bar, text="  Grafo Nao Otimizado", bg=BORDER_COLOR, fg=FG_TEXT,
+            analysis_row, text="  Grafo Nao Otimizado", bg=BORDER_COLOR, fg=FG_TEXT,
             font=("Segoe UI", 10), relief="flat", cursor="hand2",
             activebackground=BG_PANEL, activeforeground=FG_TEXT,
             padx=14, pady=6, command=self._show_nonoptimized_graph
@@ -361,7 +447,7 @@ class SQLApp(tk.Tk):
         self.btn_graph.pack(side="left", padx=(8, 0))
 
         self.btn_tuple = tk.Button(
-            btn_bar, text="  Reducao de Tuplas", bg=BORDER_COLOR, fg=FG_TEXT,
+            analysis_row, text="  Reducao de Tuplas", bg=BORDER_COLOR, fg=FG_TEXT,
             font=("Segoe UI", 10), relief="flat", cursor="hand2",
             activebackground=BG_PANEL, activeforeground=FG_TEXT,
             padx=14, pady=6, command=self._show_tuple_reduction_graph
@@ -369,7 +455,7 @@ class SQLApp(tk.Tk):
         self.btn_tuple.pack(side="left", padx=(8, 0))
 
         self.btn_attr = tk.Button(
-            btn_bar, text="  Reducao de Atributos", bg=BORDER_COLOR, fg=FG_TEXT,
+            analysis_row, text="  Reducao de Atributos", bg=BORDER_COLOR, fg=FG_TEXT,
             font=("Segoe UI", 10), relief="flat", cursor="hand2",
             activebackground=BG_PANEL, activeforeground=FG_TEXT,
             padx=14, pady=6, command=self._show_attribute_reduction_graph
@@ -377,30 +463,43 @@ class SQLApp(tk.Tk):
         self.btn_attr.pack(side="left", padx=(8, 0))
 
         self.btn_optimal = tk.Button(
-            btn_bar, text="  Plano Otimizado", bg=BG_SUCCESS, fg="white",
+            analysis_row, text="  Plano Otimizado", bg=BG_SUCCESS, fg="white",
             font=("Segoe UI", 10, "bold"), relief="flat", cursor="hand2",
             activebackground="#16a34a", activeforeground="white",
             padx=14, pady=6, command=self._show_optimal_plan_graph
         )
         self.btn_optimal.pack(side="left", padx=(8, 0))
 
-        # Status
+        # Linha 3: Status (largura total, com wrap automatico)
+        status_row = ttk.Frame(btn_outer, style="Dark.TFrame")
+        status_row.pack(fill="x", pady=(8, 0))
         self.status_var = tk.StringVar(value="Pronto")
-        self.status_label = ttk.Label(btn_bar, textvariable=self.status_var, style="Status.TLabel")
-        self.status_label.pack(side="right", pady=(4, 0))
-
-        self.row_count_var = tk.StringVar()
-        self.row_count_label = ttk.Label(btn_bar, textvariable=self.row_count_var, style="Status.TLabel")
-        self.row_count_label.pack(side="right", padx=(0, 14), pady=(4, 0))
+        # Usamos tk.Label (nao ttk) para conseguir wraplength dinamico
+        self.status_label = tk.Label(
+            status_row, textvariable=self.status_var,
+            bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 9),
+            anchor="w", justify="left", wraplength=1000
+        )
+        self.status_label.pack(fill="x")
+        # Atualiza wraplength ao redimensionar
+        status_row.bind(
+            "<Configure>",
+            lambda e: self.status_label.configure(wraplength=max(e.width - 10, 200))
+        )
 
         # ── Painel de resultados ─────────────────────────────────────────
-        results_frame = ttk.Frame(self, style="Dark.TFrame")
-        results_frame.pack(fill="both", expand=True, padx=20, pady=(14, 18))
+        # Como agora estamos dentro de um Canvas scrollavel, o results_frame
+        # nao expande sozinho. Damos altura fixa para garantir que sempre
+        # tem espaco visivel para mostrar varias linhas.
+        results_frame = ttk.Frame(scrollable, style="Dark.TFrame")
+        results_frame.pack(fill="x", expand=False, padx=20, pady=(14, 18))
 
         ttk.Label(results_frame, text="RESULTADOS", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
 
-        tree_border = tk.Frame(results_frame, bg=BORDER_COLOR, highlightthickness=0)
-        tree_border.pack(fill="both", expand=True)
+        tree_border = tk.Frame(results_frame, bg=BORDER_COLOR, highlightthickness=0,
+                                height=380)
+        tree_border.pack(fill="x")
+        tree_border.pack_propagate(False)  # respeita o height fixo
 
         tree_inner = tk.Frame(tree_border, bg=BG_EDITOR, highlightthickness=0)
         tree_inner.pack(fill="both", expand=True, padx=1, pady=1)
@@ -412,7 +511,7 @@ class SQLApp(tk.Tk):
         x_scroll.pack(side="bottom", fill="x")
 
         self.tree = ttk.Treeview(
-            tree_inner, show="headings",
+            tree_inner, show="headings", height=12,
             yscrollcommand=y_scroll.set,
             xscrollcommand=x_scroll.set
         )
@@ -442,6 +541,7 @@ class SQLApp(tk.Tk):
 
         # Hover nos botoes
         for btn, bg_normal in [(self.btn_exec, BG_BUTTON), (self.btn_clear, BORDER_COLOR),
+                                (self.btn_config, BORDER_COLOR),
                                 (self.btn_parse, BORDER_COLOR), (self.btn_graph, BORDER_COLOR),
                                 (self.btn_tuple, BORDER_COLOR), (self.btn_attr, BORDER_COLOR),
                                 (self.btn_optimal, BG_SUCCESS)]:
@@ -547,12 +647,23 @@ class SQLApp(tk.Tk):
         self.tree["columns"] = ()
         for item in self.tree.get_children():
             self.tree.delete(item)
+        self.empty_label.config(text="Nenhum resultado ainda.\nDigite uma query e pressione Executar.",
+                                fg=FG_DIM, font=("Segoe UI", 11))
         self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
-        self.status_var.set("Pronto")
-        self.status_label.configure(style="Status.TLabel")
+        self._set_status("Pronto", "info")
         self.row_count_var.set("")
         self._update_line_numbers()
         self.sql_editor.focus_set()
+
+    def _set_status(self, msg, kind="info"):
+        """Atualiza o status com cor adequada (info/ok/erro)."""
+        colors = {"info": FG_DIM, "ok": BG_SUCCESS, "erro": BG_ERROR}
+        weights = {"info": "normal", "ok": "bold", "erro": "bold"}
+        self.status_var.set(msg)
+        self.status_label.configure(
+            fg=colors.get(kind, FG_DIM),
+            font=("Segoe UI", 9, weights.get(kind, "normal"))
+        )
 
     # ── Executar query ───────────────────────────────────────────────────
     def _execute(self):
@@ -572,30 +683,23 @@ class SQLApp(tk.Tk):
             parsed = parser.parse()
             table_name = parsed.get('table', '?')
         except Exception as e:
-            self.status_var.set(f"Parser Error: {e}")
-            self.status_label.configure(style="Error.TLabel")
+            self._set_status(f"Parser Error: {e}", "erro")
             self.row_count_var.set("")
+            self._show_error_in_results("Erro de Parser", str(e))
             return
 
         # 1.5) Validar contra o schema bd_vendas (item 4.b do enunciado)
         schema_errors = validate_against_schema(parsed)
         if schema_errors:
-            self.status_var.set(f"Validacao: {len(schema_errors)} erro(s)")
-            self.status_label.configure(style="Error.TLabel")
+            self._set_status(f"Validacao: {len(schema_errors)} erro(s) — veja detalhes abaixo", "erro")
             self.row_count_var.set("")
-            msg = "Validacao do schema falhou:\n\n" + "\n".join(f"  - {e}" for e in schema_errors)
-            self.empty_label.config(text=msg)
-            self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
+            msg = "\n".join(f"  - {e}" for e in schema_errors)
+            self._show_error_in_results("Validacao do Schema falhou", msg)
             return
 
-        # 2) Executar no MySQL
+        # 2) Executar no MySQL (usa DB_CONFIG global, configuravel pelo botao "Conexao BD")
         try:
-            db = mysql.connector.connect(
-                host="localhost",
-                user="root",
-                password="132654",
-                database="bd_vendas"
-            )
+            db = mysql.connector.connect(**DB_CONFIG)
             cursor = db.cursor()
             cursor.execute(query)
             results = cursor.fetchall()
@@ -619,23 +723,133 @@ class SQLApp(tk.Tk):
 
             count = len(results)
             self.row_count_var.set(f"{count} linha{'s' if count != 1 else ''}")
-            self.status_var.set(f"OK  -  Tabela: {table_name}")
-            self.status_label.configure(style="Success.TLabel")
+            self._set_status(f"OK  -  Tabela: {table_name}", "ok")
 
             if count == 0:
-                self.empty_label.config(text="Query executada com sucesso.\n0 resultados retornados.")
+                self.empty_label.config(
+                    text="Query executada com sucesso.\n0 resultados retornados.",
+                    fg=FG_DIM, font=("Segoe UI", 11))
                 self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
 
         except mysql.connector.Error as err:
-            self.status_var.set(f"MySQL Error: {err}")
-            self.status_label.configure(style="Error.TLabel")
+            self._set_status(f"MySQL Error {err.errno}: {err.msg}", "erro")
             self.row_count_var.set("")
-            self.empty_label.config(text=f"Erro ao executar query.\n{err}")
-            self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
+            hint = self._mysql_error_hint(err)
+            self._show_error_in_results(f"Erro do MySQL  (codigo {err.errno})", str(err.msg), hint)
         finally:
             if 'db' in locals() and db.is_connected():
                 cursor.close()
                 db.close()
+
+    def _show_error_in_results(self, title, detail, hint=""):
+        """Mostra um erro grande e legivel no painel de resultados."""
+        text = f"{title}\n\n{detail}"
+        if hint:
+            text += f"\n\nDica:\n{hint}"
+        self.empty_label.config(text=text, fg=BG_ERROR,
+                                font=("Segoe UI", 11, "bold"), justify="left")
+        self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _mysql_error_hint(self, err):
+        """Sugestoes para erros comuns do MySQL."""
+        code = getattr(err, "errno", None)
+        if code == 1045:
+            return ("Senha incorreta. Use o botao 'Conexao BD' para configurar\n"
+                    "usuario/senha sem precisar editar o codigo.")
+        if code == 1049:
+            return ("O banco de dados nao existe. Rode o script bd_vendas.sql primeiro,\n"
+                    "ou ajuste o nome do banco em 'Conexao BD'.")
+        if code == 2003:
+            return ("Servidor MySQL nao esta acessivel. Verifique se o servico\n"
+                    "esta rodando e se o host esta correto em 'Conexao BD'.")
+        if code == 1146:
+            return "Tabela nao existe. Confira se rodou o script bd_vendas.sql completo."
+        return ""
+
+    # ── Dialog: configurar conexao MySQL ─────────────────────────────────
+    def _show_db_config(self):
+        win = tk.Toplevel(self)
+        win.title("Configurar Conexao MySQL")
+        win.geometry("480x380")
+        win.configure(bg=BG_DARK)
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+
+        tk.Label(win, text="CONEXAO MYSQL", bg=BG_DARK, fg=FG_ACCENT,
+                 font=("Segoe UI", 14, "bold")).pack(pady=(18, 4))
+        tk.Label(win, text="Editar conexao usada pelo botao Executar",
+                 bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 9)).pack()
+
+        form = tk.Frame(win, bg=BG_DARK)
+        form.pack(fill="x", padx=30, pady=(18, 8))
+
+        entries = {}
+        fields = [("Host", "host"), ("Usuario", "user"),
+                  ("Senha", "password"), ("Banco de dados", "database")]
+        for i, (label, key) in enumerate(fields):
+            tk.Label(form, text=label, bg=BG_DARK, fg=FG_TEXT,
+                     font=("Segoe UI", 10), anchor="w").grid(row=i, column=0, sticky="w", pady=6)
+            ent = tk.Entry(form, bg=BG_EDITOR, fg=FG_TEXT,
+                           insertbackground=FG_ACCENT, relief="flat",
+                           font=("Cascadia Code", 10), width=32,
+                           show="*" if key == "password" else "")
+            ent.grid(row=i, column=1, sticky="ew", padx=(12, 0), pady=6, ipady=4)
+            ent.insert(0, str(DB_CONFIG.get(key, "")))
+            entries[key] = ent
+        form.columnconfigure(1, weight=1)
+
+        # Status do teste de conexao
+        test_var = tk.StringVar(value="")
+        test_label = tk.Label(win, textvariable=test_var, bg=BG_DARK, fg=FG_DIM,
+                              font=("Segoe UI", 9), wraplength=420, justify="left")
+        test_label.pack(fill="x", padx=30, pady=(6, 4))
+
+        def collect():
+            return {k: e.get().strip() for k, e in entries.items()}
+
+        def do_test():
+            cfg = collect()
+            test_var.set("Testando conexao...")
+            test_label.configure(fg=FG_DIM)
+            win.update_idletasks()
+            try:
+                conn = mysql.connector.connect(**cfg)
+                conn.close()
+                test_var.set("[OK] Conexao bem sucedida.")
+                test_label.configure(fg=BG_SUCCESS)
+            except mysql.connector.Error as err:
+                test_var.set(f"[ERRO] {err.errno}: {err.msg}")
+                test_label.configure(fg=BG_ERROR)
+
+        def do_save():
+            DB_CONFIG.update(collect())
+            ok = _save_db_config()
+            if ok:
+                test_var.set(f"[OK] Salvo em db_config.json")
+                test_label.configure(fg=BG_SUCCESS)
+                self._set_status("Conexao atualizada", "ok")
+                win.after(700, win.destroy)
+            else:
+                test_var.set("[ERRO] Nao foi possivel salvar o arquivo.")
+                test_label.configure(fg=BG_ERROR)
+
+        # Botoes
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill="x", padx=30, pady=(8, 18))
+
+        tk.Button(btns, text="  Testar  ", bg=BORDER_COLOR, fg=FG_TEXT,
+                  font=("Segoe UI", 10), relief="flat", cursor="hand2",
+                  activebackground=BG_PANEL, activeforeground=FG_TEXT,
+                  padx=14, pady=6, command=do_test).pack(side="left")
+        tk.Button(btns, text="  Cancelar  ", bg=BORDER_COLOR, fg=FG_TEXT,
+                  font=("Segoe UI", 10), relief="flat", cursor="hand2",
+                  activebackground=BG_PANEL, activeforeground=FG_TEXT,
+                  padx=14, pady=6, command=win.destroy).pack(side="right")
+        tk.Button(btns, text="  Salvar  ", bg=BG_SUCCESS, fg="white",
+                  font=("Segoe UI", 10, "bold"), relief="flat", cursor="hand2",
+                  activebackground="#16a34a", activeforeground="white",
+                  padx=14, pady=6, command=do_save).pack(side="right", padx=(0, 8))
 
     # ── Mostrar arvore do parser ─────────────────────────────────────────
     def _show_parse_tree(self):
@@ -1117,14 +1331,26 @@ class SQLApp(tk.Tk):
         tk.Label(win, text=f"Nos: {G.number_of_nodes()}  |  Arestas: {G.number_of_edges()}",
                  bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 9)).pack(anchor="w", padx=22)
 
+        # Canvas do grafo com scroll horizontal E vertical
         cf = tk.Frame(win, bg=BORDER_COLOR)
         cf.pack(fill="both", expand=True, padx=20, pady=(10, 6))
-        hbar = tk.Scrollbar(cf, orient="horizontal")
-        hbar.pack(side="bottom", fill="x")
+        cf.rowconfigure(0, weight=1)
+        cf.columnconfigure(0, weight=1)
+
+        vbar = ttk.Scrollbar(cf, orient="vertical")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar = ttk.Scrollbar(cf, orient="horizontal")
+        hbar.grid(row=1, column=0, sticky="ew")
+
         canvas = tk.Canvas(cf, bg=BG_EDITOR, highlightthickness=0,
-                           xscrollcommand=hbar.set)
-        canvas.pack(fill="both", expand=True, padx=1, pady=1)
+                           xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        vbar.config(command=canvas.yview)
         hbar.config(command=canvas.xview)
+
+        # Roda do mouse rola verticalmente quando estiver sobre esta janela
+        win.bind("<MouseWheel>",
+                 lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
 
         def redraw(*_):
             canvas.delete("all")
@@ -1356,14 +1582,26 @@ class SQLApp(tk.Tk):
                      font=("Cascadia Code", 9)).pack(anchor="w", padx=20)
         tk.Label(h_frame, text="", bg=BG_PANEL).pack(pady=2)
 
-        # Canvas do grafo
+        # Canvas do grafo com scroll horizontal E vertical
         cf = tk.Frame(win, bg=BORDER_COLOR)
         cf.pack(fill="both", expand=True, padx=20, pady=(6, 6))
-        hbar = tk.Scrollbar(cf, orient="horizontal")
-        hbar.pack(side="bottom", fill="x")
-        canvas = tk.Canvas(cf, bg=BG_EDITOR, highlightthickness=0, xscrollcommand=hbar.set)
-        canvas.pack(fill="both", expand=True, padx=1, pady=1)
+        cf.rowconfigure(0, weight=1)
+        cf.columnconfigure(0, weight=1)
+
+        vbar = ttk.Scrollbar(cf, orient="vertical")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar = ttk.Scrollbar(cf, orient="horizontal")
+        hbar.grid(row=1, column=0, sticky="ew")
+
+        canvas = tk.Canvas(cf, bg=BG_EDITOR, highlightthickness=0,
+                           xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        vbar.config(command=canvas.yview)
         hbar.config(command=canvas.xview)
+
+        # Roda do mouse rola verticalmente quando estiver sobre esta janela
+        win.bind("<MouseWheel>",
+                 lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
 
         def redraw(*_):
             canvas.delete("all")
@@ -1407,20 +1645,44 @@ class SQLApp(tk.Tk):
         canvas.bind("<Configure>", redraw)
 
         # Painel: plano de execucao TEXTUAL didatico (item 2c do enunciado)
+        # Usa Text com tags coloridas + scrollbar para suportar muitos passos.
         plan_frame = tk.Frame(win, bg=BG_PANEL)
         plan_frame.pack(fill="x", padx=20, pady=(0, 16))
         tk.Label(plan_frame, text="Plano de Execucao  (passo a passo, bottom-up)",
                  bg=BG_PANEL, fg=FG_TABLE_HD,
                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
+
+        plan_box = tk.Frame(plan_frame, bg=BG_PANEL)
+        plan_box.pack(fill="x", padx=10, pady=(0, 10))
+
+        plan_vbar = ttk.Scrollbar(plan_box, orient="vertical")
+        plan_vbar.pack(side="right", fill="y")
+
+        plan_text = tk.Text(plan_box, bg=BG_PANEL, fg=FG_TEXT,
+                            font=("Cascadia Code", 10), relief="flat",
+                            padx=8, pady=4, wrap="word",
+                            highlightthickness=0, borderwidth=0,
+                            height=8, yscrollcommand=plan_vbar.set)
+        plan_text.pack(side="left", fill="both", expand=True)
+        plan_vbar.config(command=plan_text.yview)
+
+        # Tag por tipo de no -> cor consistente com o grafo
+        for ntype, st in STYLES.items():
+            plan_text.tag_configure(ntype, foreground=st["fg"])
+
         ordered = sorted(G.nodes(data=True), key=lambda x: (x[1].get("order", 0), x[0]))
         for idx, (nid, data) in enumerate(ordered, 1):
             ntype = data.get("type", "table")
-            st = STYLES.get(ntype, {"fg": FG_TEXT})
             descr = self._describe_step(ntype, data.get("label", nid))
-            tk.Label(plan_frame, text=f"  Passo {idx}.  {descr}",
-                     bg=BG_PANEL, fg=st["fg"],
-                     font=("Cascadia Code", 10), anchor="w").pack(anchor="w", padx=18)
-        tk.Label(plan_frame, text="", bg=BG_PANEL).pack(pady=2)
+            plan_text.insert("end", f"  Passo {idx}.  {descr}\n", ntype)
+
+        plan_text.config(state="disabled")
+
+        # Mouse wheel rola SO o Text (consome o evento para nao rolar o grafo)
+        def _plan_wheel(e):
+            plan_text.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            return "break"
+        plan_text.bind("<MouseWheel>", _plan_wheel)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
