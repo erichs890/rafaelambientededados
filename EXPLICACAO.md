@@ -15,7 +15,7 @@
 6. [Como o código funciona — passo a passo](#6-como-o-código-funciona--passo-a-passo)
 7. [Validação de Schema (bd_vendas)](#7-validação-de-schema-bd_vendas)
 8. [As quatro visualizações de grafo (o coração do trabalho)](#8-as-quatro-visualizações-de-grafo-o-coração-do-trabalho)
-9. [⭐ As Heurísticas (referência completa)](#9--as-heurísticas-referência-completa)
+9. [As Heurísticas (referência completa)](#9--as-heurísticas-referência-completa)
 10. [Múltiplos INNER JOINs (queries com 3+ tabelas)](#10-múltiplos-inner-joins-queries-com-3-tabelas)
 11. [Exemplo completo: do SQL ao plano otimizado](#11-exemplo-completo-do-sql-ao-plano-otimizado)
 12. [Mapeamento dos critérios de avaliação](#12-mapeamento-dos-critérios-de-avaliação)
@@ -550,7 +550,7 @@ Veja [_render_graph_window linhas 639-703](trabalho_rafael(1)(1).py#L639-L703) e
 
 ---
 
-## 9. ⭐ As Heurísticas (referência completa)
+## 9. As Heurísticas (referência completa)
 
 > Esta seção reúne **todas as heurísticas** do projeto em um único lugar, com a teoria, a intuição e o código. Use como referência rápida ao apresentar o trabalho.
 
