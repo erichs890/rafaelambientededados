@@ -15,9 +15,10 @@
 6. [Como o código funciona — passo a passo](#6-como-o-código-funciona--passo-a-passo)
 7. [Validação de Schema (bd_vendas)](#7-validação-de-schema-bd_vendas)
 8. [As quatro visualizações de grafo (o coração do trabalho)](#8-as-quatro-visualizações-de-grafo-o-coração-do-trabalho)
-9. [Exemplo completo: do SQL ao plano otimizado](#9-exemplo-completo-do-sql-ao-plano-otimizado)
-10. [Mapeamento dos critérios de avaliação](#10-mapeamento-dos-critérios-de-avaliação)
-11. [Glossário rápido](#11-glossário-rápido)
+9. [Múltiplos INNER JOINs (queries com 3+ tabelas)](#9-múltiplos-inner-joins-queries-com-3-tabelas)
+10. [Exemplo completo: do SQL ao plano otimizado](#10-exemplo-completo-do-sql-ao-plano-otimizado)
+11. [Mapeamento dos critérios de avaliação](#11-mapeamento-dos-critérios-de-avaliação)
+12. [Glossário rápido](#12-glossário-rápido)
 
 ---
 
@@ -208,7 +209,7 @@ E o método `parse()` segue a gramática:
 
 ```
 SELECT <colunas> FROM <tabela>
-       [INNER JOIN <tabela2> ON <condição>]
+       (INNER JOIN <tabela_n> ON <condição>)*    ← zero ou mais joins
        [WHERE <condição>]
 ```
 
@@ -218,10 +219,27 @@ SELECT <colunas> FROM <tabela>
 {
   "columns": ["nome"],
   "table": "cliente",
+  "joins": [],
   "where": [["idade", ">", "18"]]
 }
 ```
 
+**Saída para uma query com 2 INNER JOINs**:
+
+```json
+{
+  "columns": ["cliente.Nome", "pedido.ValorTotalPedido", "status.Descricao"],
+  "table": "cliente",
+  "joins": [
+    {"table": "pedido", "on": [["cliente.idCliente", "=", "pedido.Cliente_idCliente"]]},
+    {"table": "status", "on": [["pedido.Status_idStatus", "=", "status.idStatus"]]}
+  ],
+  "where": [["cliente.Nome", "=", "'Joao'"]]
+}
+```
+
+> O campo `joins` é uma **lista** que pode ter 0, 1, 2 ou mais entradas. Cada entrada tem `table` (nome da tabela junta) e `on` (lista de predicados achatada).
+>
 > Limitação importante: o parser **só entende `AND`** entre condições, não `OR`. Veja [parse_condition linhas 86-105](trabalho_rafael(1)(1).py#L86-L105).
 
 ### 6.3. `_execute()` — rodar a query
@@ -531,7 +549,141 @@ Veja [_render_graph_window linhas 639-703](trabalho_rafael(1)(1).py#L639-L703) e
 
 ---
 
-## 9. Exemplo completo: do SQL ao plano otimizado
+## 9. Múltiplos INNER JOINs (queries com 3+ tabelas)
+
+O enunciado pede suporte a `INNER JOIN`, sem especificar quantos. O parser foi estendido para aceitar **N joins encadeados**, cobrindo queries reais que cruzam várias tabelas.
+
+### 9.1. Como o parser representa N joins
+
+Antes (versão inicial, só 1 JOIN):
+
+```python
+# parsed era assim:
+{ "table": "cliente",
+  "join_table": "pedido",          # ← campo único
+  "join_on": [["...", "=", "..."]] }
+```
+
+Agora (versão atual, N JOINs):
+
+```python
+{ "table": "cliente",
+  "joins": [                        # ← lista
+    {"table": "pedido", "on": [["cliente.idCliente", "=", "pedido.Cliente_idCliente"]]},
+    {"table": "status", "on": [["pedido.Status_idStatus", "=", "status.idStatus"]]}
+  ] }
+```
+
+A mudança é só estrutural — o parser executa um `while` em vez de um `if`:
+
+```python
+data['joins'] = []
+while self.peek() and self.peek().upper() == "INNER":
+    self.consume("INNER")
+    self.consume("JOIN")
+    join_table = self.consume()
+    join_on = []
+    if self.peek() and self.peek().upper() == "ON":
+        self.consume("ON")
+        join_on = self.parse_condition()
+    data['joins'].append({'table': join_table, 'on': join_on})
+```
+
+### 9.2. O que mudou nos consumidores
+
+Quatro lugares precisaram ser atualizados para iterar a lista em vez de checar um único campo:
+
+| Onde | Antes | Agora |
+|---|---|---|
+| `validate_against_schema` | `if join_lower not in SCHEMA: ...` | `for j in joins: if j['table'].lower() not in SCHEMA: ...` |
+| `_build_nonoptimized_graph` | mesmo padrão | itera `joins` para coletar tabelas e condições |
+| `_build_tuple_reduction_graph` | mesmo padrão | itera `joins` para coletar predicados |
+| `_build_attribute_reduction_graph` | mesmo padrão | itera `joins` |
+| `_build_optimal_plan_graph` | mesmo padrão | itera `joins` |
+
+Padrão de coleta de tabelas:
+
+```python
+tables = [parsed["table"]]
+for j in parsed.get('joins', []):
+    tables.append(j['table'])
+```
+
+Padrão de coleta de predicados:
+
+```python
+predicates = []
+for j in parsed.get('joins', []):
+    if j.get('on'):
+        predicates.extend(self._flatten_conjunction(j['on']))
+if "where" in parsed:
+    predicates.extend(self._flatten_conjunction(parsed["where"]))
+```
+
+### 9.3. Como ficam os grafos com 3+ tabelas
+
+Para uma query com 3 tabelas (ex: `cliente ⋈ pedido ⋈ status`):
+
+**Não Otimizado** — produto cartesiano N-ário, depois seleção monstro, depois projeção:
+
+```
+        π colunas
+            │
+        σ todas as condições juntas
+            │
+            ×
+          ╱ │ ╲
+       T0  T1  T2
+```
+
+**Plano Otimizado** — mesma lógica de antes, só que com mais folhas:
+
+```
+                π colunas
+                    │
+            ⋈ todos os predicados de junção
+          ╱         │         ╲
+       π loc0    π loc1     π loc2
+         │         │           │
+      σ loc0    (sem σ)     (sem σ)
+         │
+       T0[PRIMARIA]    T1         T2
+```
+
+A heurística de **reordenação de folhas** continua funcionando: a tabela com mais predicados locais ainda recebe o badge `[PRIMARIA]` e fica como primeira aresta do JOIN. Com 3 tabelas, isso pode ser ainda mais visível — pode existir uma tabela primária E uma "secundária com filtros", ambas posicionadas antes das que não têm filtro.
+
+### 9.4. Exemplo prático
+
+```sql
+SELECT cliente.Nome, pedido.ValorTotalPedido, status.Descricao
+FROM cliente
+INNER JOIN pedido ON cliente.idCliente = pedido.Cliente_idCliente
+INNER JOIN status ON pedido.Status_idStatus = status.idStatus
+WHERE cliente.Nome = 'Joao'
+```
+
+Classificação dos predicados:
+
+| Predicado | Tabelas referenciadas | Tipo |
+|---|---|---|
+| `cliente.idCliente = pedido.Cliente_idCliente` | `{cliente, pedido}` | multi → entra no JOIN |
+| `pedido.Status_idStatus = status.idStatus` | `{pedido, status}` | multi → entra no JOIN |
+| `cliente.Nome = 'Joao'` | `{cliente}` | local → vira σ em cliente |
+
+No grafo do **Plano Otimizado** o nó JOIN agora carrega **2 condições** unidas por `AND`, e `cliente` aparece marcado como `[PRIMARIA]`.
+
+### 9.5. Limitação visual
+
+O grafo trata o JOIN como uma operação **N-ária** (um nó com N folhas), não como uma árvore binária esquerda-profunda (`((T0 ⋈ T1) ⋈ T2)`). Isso é uma simplificação didática:
+
+- ✅ **Vantagem**: mais simples de ler, mostra todos os predicados de junção em um lugar.
+- ⚠️ **Limitação**: SGBDs reais escolhem uma ORDEM de junção (qual par junta primeiro). Esse projeto não faz cost-based join ordering — só a reordenação de folhas heurística.
+
+Se você quiser implementar join ordering binário (uma extensão clássica), seria a próxima evolução natural do `_build_optimal_plan_graph`.
+
+---
+
+## 10. Exemplo completo: do SQL ao plano otimizado
 
 Vamos rastrear o que acontece quando você digita uma query **válida** (com nomes corretos do `bd_vendas`):
 
@@ -645,7 +797,7 @@ Passo 7.  Aplicar PROJECAO (pi): mantem apenas as colunas cliente.Nome, pedido.V
 
 ---
 
-## 10. Mapeamento dos critérios de avaliação
+## 11. Mapeamento dos critérios de avaliação
 
 | Critério (PDF) | Pontos | Onde está implementado |
 |---|---|---|
@@ -664,7 +816,7 @@ Passo 7.  Aplicar PROJECAO (pi): mantem apenas as colunas cliente.Nome, pedido.V
 
 ---
 
-## 11. Glossário rápido
+## 12. Glossário rápido
 
 | Termo | Significado |
 |---|---|
@@ -677,14 +829,17 @@ Passo 7.  Aplicar PROJECAO (pi): mantem apenas as colunas cliente.Nome, pedido.V
 | **Predicado** | Uma condição booleana, ex: `idade > 18` |
 | **Cardinalidade** | Quantidade de linhas de uma relação |
 | **Heurística** | Regra prática que costuma melhorar o resultado, sem garantir o ótimo absoluto |
+| **Join N-ário** | Operação de junção que combina N tabelas de uma vez, em vez de pares |
+| **Left-deep tree** | Árvore de joins onde o lado esquerdo é sempre o resultado intermediário |
 
 ---
 
 ## TL;DR
 
-- O programa parseia SQL → **valida contra o schema bd_vendas** → executa no MySQL → desenha **4 planos de execução** em álgebra relacional.
+- O programa parseia SQL (com **N INNER JOINs encadeados**) → **valida contra o schema bd_vendas** → executa no MySQL → desenha **4 planos de execução** em álgebra relacional.
 - O plano "não otimizado" mostra **como não fazer** (× antes de σ).
 - A **Redução de Tuplas** (5a-i) empurra σ para perto das tabelas → JOIN com menos linhas.
 - A **Redução de Atributos** (5a-ii) empurra π para perto das tabelas → JOIN com linhas menores.
 - O **Plano Otimizado** combina tudo e ainda **reordena folhas** (mais restritiva primeiro, 5b-i) e **evita cartesiano** (5b-ii), mostrando um checklist das heurísticas aplicadas e um plano de execução textual passo a passo.
+- Funciona com **2, 3 ou mais tabelas** — o parser aceita uma cadeia de `INNER JOIN ... ON ...` e os 4 graph builders iteram sobre a lista de joins.
 - Resultado: cobre os 10,0 pontos do enunciado.
