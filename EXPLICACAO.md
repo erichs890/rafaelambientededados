@@ -15,10 +15,11 @@
 6. [Como o código funciona — passo a passo](#6-como-o-código-funciona--passo-a-passo)
 7. [Validação de Schema (bd_vendas)](#7-validação-de-schema-bd_vendas)
 8. [As quatro visualizações de grafo (o coração do trabalho)](#8-as-quatro-visualizações-de-grafo-o-coração-do-trabalho)
-9. [Múltiplos INNER JOINs (queries com 3+ tabelas)](#9-múltiplos-inner-joins-queries-com-3-tabelas)
-10. [Exemplo completo: do SQL ao plano otimizado](#10-exemplo-completo-do-sql-ao-plano-otimizado)
-11. [Mapeamento dos critérios de avaliação](#11-mapeamento-dos-critérios-de-avaliação)
-12. [Glossário rápido](#12-glossário-rápido)
+9. [⭐ As Heurísticas (referência completa)](#9--as-heurísticas-referência-completa)
+10. [Múltiplos INNER JOINs (queries com 3+ tabelas)](#10-múltiplos-inner-joins-queries-com-3-tabelas)
+11. [Exemplo completo: do SQL ao plano otimizado](#11-exemplo-completo-do-sql-ao-plano-otimizado)
+12. [Mapeamento dos critérios de avaliação](#12-mapeamento-dos-critérios-de-avaliação)
+13. [Glossário rápido](#13-glossário-rápido)
 
 ---
 
@@ -549,7 +550,227 @@ Veja [_render_graph_window linhas 639-703](trabalho_rafael(1)(1).py#L639-L703) e
 
 ---
 
-## 9. Múltiplos INNER JOINs (queries com 3+ tabelas)
+## 9. ⭐ As Heurísticas (referência completa)
+
+> Esta seção reúne **todas as heurísticas** do projeto em um único lugar, com a teoria, a intuição e o código. Use como referência rápida ao apresentar o trabalho.
+
+### O que é uma "heurística" aqui?
+
+Em otimização de consultas, uma **heurística** é uma **regra prática** aplicada na árvore de álgebra relacional que **costuma** produzir um plano mais barato sem precisar calcular o custo exato. Não é garantia de ótimo absoluto — é "no geral, aplicar isso é melhor que não aplicar".
+
+O enunciado pede 5 heurísticas, que se dividem em dois grupos:
+
+| Grupo | Heurística | Botão na UI |
+|---|---|---|
+| **5a** Reduzir o tamanho dos resultados intermediários | 5a-i Redução de Tuplas | Redução de Tuplas |
+| | 5a-ii Redução de Atributos | Redução de Atributos |
+| **5b** Aplicar primeiro as operações mais restritivas | 5b-i Reordenação de folhas | Plano Otimizado (verde) |
+| | 5b-ii Evitar produto cartesiano | Plano Otimizado (verde) |
+| | 5b-iii Ajustar o resto da árvore | Plano Otimizado (verde) |
+
+---
+
+### Heurística 5a-i — Redução de Tuplas (selection pushdown)
+
+#### O que é
+Empurrar a operação σ (seleção, "WHERE") para o **mais perto possível** das tabelas folha, antes de qualquer JOIN.
+
+#### Por quê funciona
+Filtrar **diminui linhas**. Se você filtra antes do JOIN, o JOIN trabalha com menos linhas → menos comparações → menos memória. Filtrar depois do JOIN é desperdício: você juntou linhas que ia jogar fora.
+
+> **Exemplo numérico**: cliente tem 1M linhas, pedido tem 5M.
+> - Filtrar primeiro (`cidade='Recife'`) → cliente vira 50K → JOIN faz `50K × 5M = 250 bilhões` de comparações.
+> - Filtrar depois → JOIN faz `1M × 5M = 5 trilhões` e depois descarta.
+> - Diferença: **20×** mais trabalho na ordem ruim.
+
+#### Como o código aplica
+Em [`_build_tuple_reduction_graph`](trabalho_rafael(1)(1).py):
+
+1. Coleta todos os predicados de WHERE e JOIN ON em uma lista plana (`_flatten_conjunction`).
+2. Para cada predicado, descobre quantas tabelas ele referencia (via `_predicate_tables`, que olha o prefixo `tabela.coluna`).
+3. **1 tabela** → vira σ local *em cima daquela tabela*.
+4. **2+ tabelas** → vira condição do `⋈` (uma só, no topo).
+
+#### Antes / Depois
+
+```
+ANTES (não otimizado)              DEPOIS (5a-i aplicada)
+                                  
+        π                                  π
+        │                                  │
+        σ (todas as condições)             ⋈ (só predicados de junção)
+        │                                ╱   ╲
+        ×                          σ_local    pedido
+       ╱ ╲                            │
+   cliente pedido                  cliente
+```
+
+---
+
+### Heurística 5a-ii — Redução de Atributos (projection pushdown)
+
+#### O que é
+Empurrar a operação π (projeção, lista de colunas) para o mais perto possível das tabelas, mantendo só as colunas estritamente necessárias.
+
+#### Por quê funciona
+Cada linha em memória ocupa N bytes (1 por coluna). Se uma tabela tem coluna `descricao TEXT` de 200 bytes mas você nunca a usa, carregar essa coluna pelo JOIN inteiro é desperdício enorme. Projetar antes = **linhas mais leves**, mais cabem na memória, menos I/O.
+
+> **Exemplo**: tabela `produto` tem 6 colunas. Você só precisa de `idProduto` e `Nome` no resultado final. Se projetar π antes do JOIN, cada linha que sobe pra junção tem ~50 bytes em vez de 250. Em 5M linhas, isso é 1 GB vs 250 MB de dados em memória.
+
+#### Como o código aplica
+Em [`_build_attribute_reduction_graph`](trabalho_rafael(1)(1).py):
+
+Para cada tabela `t`, calcula o conjunto **mínimo** de colunas que precisam subir:
+
+1. Colunas que aparecem no SELECT final e pertencem a `t` (`_columns_for_table`).
+2. Colunas usadas em qualquer predicado (local OU de junção) que referenciem `t`.
+3. União dos dois → coloca um `π` logo acima (ou no lugar) do σ local.
+
+```python
+all_cols = list(dict.fromkeys(cols_for_t + pred_cols)) or ["*"]
+```
+
+#### Antes / Depois
+
+```
+ANTES                                  DEPOIS (5a-ii aplicada)
+
+        π Nome, valor                          π Nome, valor
+            │                                       │
+            ⋈                                       ⋈
+          ╱   ╲                                   ╱   ╲
+         σ    pedido                       π id,Nome  π Cli_id,valor
+         │      │                                │           │
+         T0    T1                            σ Nome     pedido
+                                                 │
+                                              cliente
+```
+
+> Importante: a coluna usada na **condição de junção** (`idCliente`, `Cliente_idCliente`) também precisa subir, mesmo se o usuário não pediu ela no SELECT — senão o JOIN não tem como casar.
+
+---
+
+### Heurística 5b-i — Reordenação de folhas
+
+#### O que é
+Quando há múltiplos JOINs, escolher **qual tabela executa primeiro** (vira a "outer relation" do JOIN). Regra prática: a **tabela com mais predicados locais** vai primeiro, porque ela já vai estar reduzida.
+
+#### Por quê funciona
+A primeira tabela do JOIN dirige o loop de junção. Se ela é pequena (porque já foi filtrada), a junção faz menos iterações. Em pseudo-código:
+
+```python
+for linha_outer in tabela_outer:        # ← se for menor, o loop roda menos
+    for linha_inner in tabela_inner:
+        if condicao_de_juncao: yield ...
+```
+
+#### Como o código aplica
+Em [`_build_optimal_plan_graph`](trabalho_rafael(1)(1).py):
+
+```python
+tables_sorted = sorted(
+    tables,
+    key=lambda t: (-len(single_table_preds[t]), tables.index(t))
+)
+```
+
+Critério: ordena por **número decrescente de predicados locais**, com desempate pela ordem original (estável). A primeira tabela ganha o badge `[PRIMARIA]` no rótulo.
+
+#### Antes / Depois
+
+Para a query `... WHERE cliente.Nome = 'Joao'` (cliente tem σ local, pedido não):
+
+```
+ANTES (ordem do FROM)              DEPOIS (5b-i aplicada)
+
+         ⋈                                  ⋈
+       ╱   ╲                              ╱   ╲
+   pedido  σ Nome='Joao'         σ Nome='Joao'   pedido
+              │                       │
+           cliente             cliente [PRIMARIA]
+```
+
+---
+
+### Heurística 5b-ii — Evitar produto cartesiano
+
+#### O que é
+**Nunca** materializar o produto cartesiano (`×`) se houver uma condição que possa virar JOIN (`⋈`). Cartesiano é a operação mais cara possível.
+
+#### Por quê funciona
+- Cartesiano produz `|A| × |B|` linhas — explode rapidamente.
+- JOIN com condição usa hash join / merge join / nested loop indexado, todos muito mais baratos.
+- Em 1M × 5M, cartesiano gera **5 trilhões** de linhas; JOIN com índice gera só as ~5M que casam.
+
+#### Como o código aplica
+Em [`_build_optimal_plan_graph`](trabalho_rafael(1)(1).py):
+
+```python
+if multi_table_preds:
+    # Tem predicado que toca 2+ tabelas → vira condição do JOIN
+    G.add_node("JOIN", label=f"|x|  {cond_txt}", type="join", ...)
+else:
+    # SEM condição de junção → mostra cartesiano com aviso explícito
+    G.add_node("CART", label="X  CARTESIANO (sem condicao de juncao!)", ...)
+```
+
+#### Caso especial — quando não dá pra evitar
+
+Se o usuário escreve uma query com 2 tabelas no FROM mas **sem nenhum predicado** que ligue elas (ex: `SELECT * FROM cliente, pedido` sem WHERE), a heurística não consegue substituir o cartesiano. Nesses casos o programa **exibe um aviso vermelho explícito** no nó da janela:
+
+```
+× CARTESIANO (sem condicao de juncao!)
+```
+
+E o checklist de heurísticas mostra:
+
+```
+[OK]  5b-ii AVISO: nao foi possivel evitar cartesiano (sem condicao de juncao)
+```
+
+Assim você sabe que o problema é da **query**, não do otimizador.
+
+---
+
+### Heurística 5b-iii — Ajustar o resto da árvore
+
+#### O que é
+Depois de aplicar todas as outras heurísticas, **garantir que a árvore continua válida**: cada operação recebe o que precisa, ninguém ficou pendurado, a projeção final fica no topo.
+
+#### Por quê é importante
+As outras heurísticas mexem na estrutura. Ex: ao reordenar folhas, as arestas do JOIN mudam de ponta. Ao empurrar projeções, novas operações são inseridas. Sem ajustar, a árvore ficaria inconsistente.
+
+#### Como o código aplica
+Em `_build_optimal_plan_graph`, isso acontece **automaticamente** durante a construção:
+
+1. Tabelas reordenadas viram T0, T1, T2 na nova ordem (`tables_sorted`).
+2. Cada tabela gera `T_i → SEL_i → PROJ_i` na ordem certa.
+3. As arestas do JOIN são adicionadas iterando `tables_sorted` (a ordem de inserção define a ordem visual).
+4. `PROJ_FINAL` no topo recebe a saída do JOIN.
+
+Não há um "passo de ajuste" separado — a árvore já é construída corretamente pelas outras heurísticas trabalhando juntas.
+
+---
+
+### Tabela-resumo de todas as heurísticas
+
+| # | Nome | O que faz | Implementada em |
+|---|---|---|---|
+| **5a-i** | Redução de Tuplas | Empurra σ pra perto das tabelas | `_build_tuple_reduction_graph` (botão Redução de Tuplas) e dentro de `_build_optimal_plan_graph` |
+| **5a-ii** | Redução de Atributos | Empurra π pra perto das tabelas | `_build_attribute_reduction_graph` (botão Redução de Atributos) e dentro de `_build_optimal_plan_graph` |
+| **5b-i** | Reordenação de folhas | Tabela com mais σ locais vai primeiro | `_build_optimal_plan_graph` (`tables_sorted`) |
+| **5b-ii** | Evitar cartesiano | Substitui × por ⋈ quando há predicado | `_build_optimal_plan_graph` (decisão JOIN/CART) |
+| **5b-iii** | Ajustar a árvore | Reconecta nós com a nova ordem | `_build_optimal_plan_graph` (construção integrada) |
+
+### Por que o "Plano Otimizado" é especial?
+
+Os botões **Redução de Tuplas** e **Redução de Atributos** mostram **uma heurística por vez** — bom didaticamente, para ver o efeito isolado.
+
+O botão **Plano Otimizado** aplica **todas as 5 heurísticas juntas** em uma única árvore, mais o checklist visual mostrando quais foram aplicadas naquela query específica + o plano de execução textual passo a passo. É o que um otimizador real faria.
+
+---
+
+## 10. Múltiplos INNER JOINs (queries com 3+ tabelas)
 
 O enunciado pede suporte a `INNER JOIN`, sem especificar quantos. O parser foi estendido para aceitar **N joins encadeados**, cobrindo queries reais que cruzam várias tabelas.
 
@@ -683,7 +904,7 @@ Se você quiser implementar join ordering binário (uma extensão clássica), se
 
 ---
 
-## 10. Exemplo completo: do SQL ao plano otimizado
+## 11. Exemplo completo: do SQL ao plano otimizado
 
 Vamos rastrear o que acontece quando você digita uma query **válida** (com nomes corretos do `bd_vendas`):
 
@@ -797,7 +1018,7 @@ Passo 7.  Aplicar PROJECAO (pi): mantem apenas as colunas cliente.Nome, pedido.V
 
 ---
 
-## 11. Mapeamento dos critérios de avaliação
+## 12. Mapeamento dos critérios de avaliação
 
 | Critério (PDF) | Pontos | Onde está implementado |
 |---|---|---|
@@ -816,7 +1037,7 @@ Passo 7.  Aplicar PROJECAO (pi): mantem apenas as colunas cliente.Nome, pedido.V
 
 ---
 
-## 12. Glossário rápido
+## 13. Glossário rápido
 
 | Termo | Significado |
 |---|---|
